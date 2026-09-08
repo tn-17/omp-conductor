@@ -44,6 +44,7 @@ export async function runWorker(input: {
   model: Model;
   directive: string;
   assignment: string;
+  worktree: string;
   signal: AbortSignal;
   onProgress: (progress: AgentProgress) => void;
 }): Promise<SingleResult> {
@@ -97,25 +98,35 @@ export async function runWorker(input: {
     "edit.blackbox.enabled": false,
     "magicKeywords.enabled": false,
   });
-  return runSubprocess({
-    cwd: ctx.cwd,
-    agent,
-    task: renderAssignment({ directive, assignment }),
-    assignment,
-    description: "Conduct local coding assignment",
-    index: 0,
-    id: `conduct-${Bun.randomUUIDv7()}`,
-    modelOverride: selector,
-    modelRegistry: ctx.modelRegistry,
-    settings,
-    taskDepth: 0,
-    enableIrc: false,
-    enableLsp: false,
-    enableMCP: false,
-    restrictToolNames: true,
-    artifactsDir: ctx.sessionManager.getArtifactsDir() ?? undefined,
-    localProtocolOptions: ctx.localProtocolOptions,
-    signal,
-    onProgress,
-  });
+  let deferredCleanup: Promise<void> | undefined;
+  try {
+    return await runSubprocess({
+      cwd: ctx.cwd,
+      worktree: input.worktree,
+      agent,
+      task: renderAssignment({ directive, assignment }),
+      assignment,
+      description: "Conduct local coding assignment",
+      index: 0,
+      id: `conduct-${Bun.randomUUIDv7()}`,
+      modelOverride: selector,
+      modelRegistry: ctx.modelRegistry,
+      settings,
+      taskDepth: 0,
+      enableIrc: false,
+      enableLsp: false,
+      enableMCP: false,
+      restrictToolNames: true,
+      artifactsDir: ctx.sessionManager.getArtifactsDir() ?? undefined,
+      localProtocolOptions: ctx.localProtocolOptions,
+      signal,
+      onProgress,
+      onCleanupDeferred: (completion) => {
+        deferredCleanup = completion;
+      },
+    });
+  } finally {
+    // Capture the candidate only after all worker-owned writes have stopped.
+    await deferredCleanup;
+  }
 }

@@ -5,5 +5,5 @@ Read-only lookup of `OMP-CONDUCT` directives in a file explicitly named by the u
 - Stale token? MUST reselect and read updated intent; NEVER bypass rejection by copying old text into `directive`.
 
 <critical>
-Lookup and preview NEVER dispatch work or authorize implementation. MUST obtain an explicit implementation request before passing the selection to `conduct_task` with an assignment. NEVER discover or implement unrelated markers automatically.
+Lookup and preview NEVER dispatch work or authorize implementation. MUST obtain an explicit implementation request before passing the selection to `conduct_task` with an assignment and an explicit `files` list. The selected source is not implicitly writable; dispatch prepares an unapplied snapshot candidate, never human approval. NEVER discover or implement unrelated markers automatically.
 </critical>

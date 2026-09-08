@@ -14,6 +14,8 @@ import {
 import { initializeExtensions } from "@oh-my-pi/pi-coding-agent/modes/runtime-init";
 import * as codingAgent from "@oh-my-pi/pi-coding-agent";
 import * as workers from "../worker";
+import * as candidates from "../candidates";
+import { getAgentDir } from "@oh-my-pi/pi-utils";
 import conductExtension from "../index";
 
 const sessions: AgentSession[] = [];
@@ -30,6 +32,28 @@ afterEach(async () => {
 async function openSession(manager?: SessionManager): Promise<AgentSession> {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "conduct-test-"));
   directories.push(directory);
+  const cwd = manager?.getCwd() ?? directory;
+  if (!manager) {
+    const init = Bun.spawnSync(["git", "init", "--quiet", cwd]);
+    if (init.exitCode !== 0) throw new Error(init.stderr.toString());
+    await Bun.write(path.join(cwd, "target.ts"), "export const value = 1;\n");
+    const add = Bun.spawnSync(["git", "-C", cwd, "add", "target.ts"]);
+    if (add.exitCode !== 0) throw new Error(add.stderr.toString());
+    const commit = Bun.spawnSync([
+      "git",
+      "-C",
+      cwd,
+      "-c",
+      "user.name=Conduct Test",
+      "-c",
+      "user.email=conduct@example.invalid",
+      "commit",
+      "--quiet",
+      "-m",
+      "fixture",
+    ]);
+    if (commit.exitCode !== 0) throw new Error(commit.stderr.toString());
+  }
   const registry = new ModelRegistry(
     await discoverAuthStorage(directory),
     path.join(directory, "models.json"),
@@ -56,7 +80,7 @@ async function openSession(manager?: SessionManager): Promise<AgentSession> {
     models: [model],
   });
   const { session } = await createAgentSession({
-    cwd: directory,
+    cwd,
     agentDir: directory,
     modelRegistry: registry,
     model: registry.find("conduct-test", "worker"),
@@ -79,6 +103,7 @@ async function openSession(manager?: SessionManager): Promise<AgentSession> {
     toolNames: ["read", "grep"],
   });
   sessions.push(session);
+  directories.push(path.join(getAgentDir(), "conduct", session.sessionManager.getSessionId()));
   await initializeExtensions(session, {
     reportSendError: (_action, error) => {
       throw error;
@@ -150,6 +175,7 @@ test("one worker at a time; off requires explicit cancellation and blocks subseq
   await command(session, "on");
   const started = Promise.withResolvers<void>();
   const spy = spyOn(workers, "runWorker").mockImplementation(async (input) => {
+    await Bun.write(path.join(input.worktree, "target.ts"), "export const value = 2;\n");
     started.resolve();
     const stopped = Promise.withResolvers<void>();
     if (input.signal.aborted) stopped.resolve();
@@ -173,7 +199,11 @@ test("one worker at a time; off requires explicit cancellation and blocks subseq
   });
   restores.push(() => spy.mockRestore());
   const tool = session.getToolByName("conduct_task")!;
-  const args = { directive: "Complete this function", assignment: "Only fill its existing body" };
+  const args = {
+    directive: "Complete this function",
+    assignment: "Only fill its existing body",
+    files: ["target.ts"],
+  };
   const first = tool.execute("first", args);
   await started.promise;
   await expect(tool.execute("second", args)).rejects.toThrow("already running");
@@ -187,9 +217,105 @@ test("one worker at a time; off requires explicit cancellation and blocks subseq
   await command(session, "off cancel");
   const cancelled = await first;
   expect(cancelled.isError).toBe(true);
+  expect(
+    await Bun.file(path.join(session.extensionRunner!.createContext().cwd, "target.ts")).text(),
+  ).toBe("export const value = 1;\n");
+  expect(session.getActiveToolNames()).toContain("conduct_candidate");
+  const retained = await session.getToolByName("conduct_candidate")!.execute("retained", {});
+  expect(retained.details).toMatchObject({
+    candidates: [{ status: "cancelled", changes: ["target.ts"] }],
+  });
   expect(session.getActiveToolNames()).not.toContain("conduct_task");
   await expect(tool.execute("third", args)).rejects.toThrow("Conduct is off");
 });
+
+test.each(["cancel", "off cancel"])(
+  "%s during capture waits without cancelling a completed candidate",
+  async (action) => {
+    const session = await openSession();
+    await command(session, "model conduct-test/worker");
+    await command(session, "on");
+    const captureStarted = Promise.withResolvers<void>();
+    const releaseCapture = Promise.withResolvers<void>();
+    let workerSignal: AbortSignal | undefined;
+    const worker = spyOn(workers, "runWorker").mockImplementation(async (input) => {
+      workerSignal = input.signal;
+      await Bun.write(path.join(input.worktree, "target.ts"), "export const value = 2;\n");
+      return {
+        index: 0,
+        id: "capture-worker",
+        agent: "conduct-worker",
+        agentSource: "project",
+        task: input.assignment,
+        exitCode: 0,
+        output: "",
+        stderr: "",
+        truncated: false,
+        durationMs: 0,
+        tokens: 0,
+        requests: 0,
+      } satisfies SingleResult;
+    });
+    const finish = candidates.finishCandidate;
+    const capture = spyOn(candidates, "finishCandidate").mockImplementation(async (...args) => {
+      captureStarted.resolve();
+      await releaseCapture.promise;
+      return finish(...args);
+    });
+    restores.push(
+      () => worker.mockRestore(),
+      () => capture.mockRestore(),
+    );
+    const execution = session.getToolByName("conduct_task")!.execute("capture", {
+      directive: "Change value to two",
+      assignment: "Only target.ts",
+      files: ["target.ts"],
+    });
+    let cancellation: Promise<void> | undefined;
+    try {
+      await captureStarted.promise;
+      const runner = session.extensionRunner!;
+      const ctx = runner.createCommandContext();
+      const notifications: { type: unknown }[] = [];
+      let commandFinished = false;
+      cancellation = Promise.resolve(
+        runner.getCommand("conduct")!.handler(action, {
+          ...ctx,
+          ui: {
+            ...ctx.ui,
+            notify: (_message, type) => {
+              notifications.push({ type });
+            },
+          },
+        }),
+      ).then(() => {
+        commandFinished = true;
+      });
+      await Promise.resolve();
+      expect(workerSignal?.aborted).toBe(false);
+      expect(commandFinished).toBe(false);
+      expect(notifications).toEqual([]);
+      releaseCapture.resolve();
+      await cancellation;
+      const completed = await execution;
+      expect(completed.isError).toBe(false);
+      expect(completed.details).toMatchObject({ status: "ready" });
+      expect(notifications).toEqual([{ type: "info" }]);
+      expect(workerSignal?.aborted).toBe(false);
+      const retained = await session.getToolByName("conduct_candidate")!.execute("retained", {});
+      expect(retained.details).toMatchObject({
+        candidates: [{ status: "ready", changes: ["target.ts"] }],
+      });
+      expect(await Bun.file(path.join(ctx.cwd, "target.ts")).text()).toBe(
+        "export const value = 1;\n",
+      );
+      expect(session.getActiveToolNames().includes("conduct_task")).toBe(action === "cancel");
+    } finally {
+      releaseCapture.resolve();
+      await Promise.allSettled([execution, ...(cancellation ? [cancellation] : [])]);
+    }
+  },
+);
 
 function selectionToken(details: unknown): string {
   if (
@@ -219,11 +345,11 @@ test("marker lookup does not dispatch; explicit tokens preserve source and rejec
   restores.push(() => spy.mockRestore());
   const select = session.getToolByName("conduct_select")!;
   const dispatch = session.getToolByName("conduct_task")!;
-  const listing = await select.execute("list", { path: filename });
+  const listing = await select.execute("list", { path: filename, marker: null, line: null });
   expect(listing.details).toMatchObject({
     markers: [{ startLine: 1 }, { name: "merge", startLine: 2, endLine: 4 }],
   });
-  const chosen = await select.execute("select", { path: filename, marker: "merge" });
+  const chosen = await select.execute("select", { path: filename, marker: "merge", line: null });
   const selection = selectionToken(chosen.details);
   expect(directives).toEqual([]);
   await expect(
@@ -231,10 +357,16 @@ test("marker lookup does not dispatch; explicit tokens preserve source and rejec
       selection,
       directive: "replacement",
       assignment: "Keep scope",
+      files: [filename],
     }),
   ).rejects.toThrow("exactly one");
   await expect(
-    dispatch.execute("selected", { selection, assignment: "Implement the named function only" }),
+    dispatch.execute("selected", {
+      selection,
+      directive: null,
+      assignment: "Implement the named function only",
+      files: [filename],
+    }),
   ).rejects.toThrow("worker-boundary-probe");
   expect(directives).toEqual([directive]);
   await Bun.write(
@@ -242,7 +374,11 @@ test("marker lookup does not dispatch; explicit tokens preserve source and rejec
     `// OMP-CONDUCT: another task\r\n${directive}\r\nconst humanEdit = true;\r\n`,
   );
   await expect(
-    dispatch.execute("stale", { selection, assignment: "Implement the named function only" }),
+    dispatch.execute("stale", {
+      selection,
+      assignment: "Implement the named function only",
+      files: [filename],
+    }),
   ).rejects.toThrow("source changed");
   expect(directives).toEqual([directive]);
 });
@@ -262,7 +398,9 @@ test("executor tasks preserve significant whitespace in freeform and selected pa
   });
   restores.push(() => spy.mockRestore());
   const dispatch = session.getToolByName("conduct_task")!;
-  await expect(dispatch.execute("freeform", { directive, assignment })).rejects.toThrow(stop);
+  await expect(
+    dispatch.execute("freeform", { directive, selection: null, assignment, files: ["target.ts"] }),
+  ).rejects.toThrow(stop);
 
   const filename = path.join(session.extensionRunner!.createContext().cwd, "banner.ts");
   await Bun.write(filename, `${directive}\r\n`);
@@ -273,6 +411,7 @@ test("executor tasks preserve significant whitespace in freeform and selected pa
     dispatch.execute("selected", {
       selection: selectionToken(chosen.details),
       assignment,
+      files: [filename],
     }),
   ).rejects.toThrow(stop);
 
@@ -281,6 +420,116 @@ test("executor tasks preserve significant whitespace in freeform and selected pa
     expect(task).toContain(directive);
     expect(task).toContain(assignment);
   }
+});
+
+test("candidates require reviewed human application and survive off and resume", async () => {
+  const session = await openSession();
+  await command(session, "model conduct-test/worker");
+  await command(session, "on");
+  const filename = path.join(session.extensionRunner!.createContext().cwd, "target.ts");
+  const spy = spyOn(workers, "runWorker").mockImplementation(async (input) => {
+    expect(input.worktree).not.toBe(session.extensionRunner!.createContext().cwd);
+    await Bun.write(path.join(input.worktree, "target.ts"), "export const value = 2;\n");
+    return {
+      index: 0,
+      id: "candidate-worker",
+      agent: "conduct-worker",
+      agentSource: "project",
+      task: input.assignment,
+      exitCode: 0,
+      output: "implemented",
+      stderr: "",
+      truncated: false,
+      durationMs: 0,
+      tokens: 0,
+      requests: 0,
+    } satisfies SingleResult;
+  });
+  restores.push(() => spy.mockRestore());
+  await session.getToolByName("conduct_task")!.execute("candidate", {
+    directive: "Change value to two",
+    assignment: "Only target.ts",
+    files: ["target.ts"],
+  });
+  expect(await Bun.file(filename).text()).toBe("export const value = 1;\n");
+  expect(session.getToolByName("conduct_apply")).toBeUndefined();
+  const ctx = session.extensionRunner!.createContext();
+  const storeDir = path.join(getAgentDir(), "conduct", session.sessionManager.getSessionId());
+  const [candidate] = await candidates.listCandidates(storeDir, ctx.cwd);
+  expect(candidate.status).toBe("ready");
+  await command(session, `apply ${candidate.id} unreviewed-token`);
+  expect(await Bun.file(filename).text()).toBe("export const value = 1;\n");
+  await command(session, "off");
+  expect(session.getActiveToolNames()).toContain("conduct_candidate");
+  const view = await session
+    .getToolByName("conduct_candidate")!
+    .execute("review", { id: candidate.id });
+  expect(view.content).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ text: expect.stringContaining("+export const value = 2;") }),
+    ]),
+  );
+  const inspected = await candidates.inspectCandidate(storeDir, ctx.cwd, candidate.id);
+  await command(session, `apply ${candidate.id} ${inspected.reviewToken}`);
+  expect(await Bun.file(filename).text()).toBe("export const value = 1;\n");
+  const manager = session.sessionManager;
+  await manager.ensureOnDisk();
+  await manager.flush();
+  const sessionFile = manager.getSessionFile()!;
+  await session.dispose();
+  sessions.splice(sessions.indexOf(session), 1);
+  const resumed = await openSession(await SessionManager.open(sessionFile));
+  expect(resumed.getActiveToolNames()).toContain("conduct_candidate");
+  const review = await resumed
+    .getToolByName("conduct_candidate")!
+    .execute("restored-review", { id: candidate.id });
+  const details = review.details as { reviewToken: string };
+  expect(details.reviewToken).toBeString();
+  await command(resumed, "on");
+  await command(resumed, `apply ${candidate.id} ${details.reviewToken}`);
+  expect(await Bun.file(filename).text()).toBe("export const value = 2;\n");
+});
+
+test("snapshot selection mismatch retains a failed candidate without dispatch", async () => {
+  const session = await openSession();
+  await command(session, "model conduct-test/worker");
+  await command(session, "on");
+  const ctx = session.extensionRunner!.createContext();
+  const filename = path.join(ctx.cwd, "marker.ts");
+  await Bun.write(filename, "// OMP-CONDUCT: finish target\n");
+  const selected = await session
+    .getToolByName("conduct_select")!
+    .execute("select", { path: filename });
+  const prepare = candidates.prepareCandidate;
+  const spy = spyOn(candidates, "prepareCandidate").mockImplementation(async (input) => {
+    const prepared = await prepare(input);
+    await Bun.write(
+      path.join(prepared.worktree, "marker.ts"),
+      "// OMP-CONDUCT: different request\n",
+    );
+    return prepared;
+  });
+  const worker = spyOn(workers, "runWorker").mockImplementation(async () => {
+    throw new Error("must not dispatch");
+  });
+  restores.push(
+    () => spy.mockRestore(),
+    () => worker.mockRestore(),
+  );
+  await expect(
+    session.getToolByName("conduct_task")!.execute("mismatch", {
+      selection: selectionToken(selected.details),
+      assignment: "Implement target only",
+      files: ["target.ts"],
+    }),
+  ).rejects.toThrow("snapshot mismatch");
+  expect(worker).not.toHaveBeenCalled();
+  expect(await Bun.file(filename).text()).toBe("// OMP-CONDUCT: finish target\n");
+  const records = await candidates.listCandidates(
+    path.join(getAgentDir(), "conduct", session.sessionManager.getSessionId()),
+    ctx.cwd,
+  );
+  expect(records).toMatchObject([{ status: "failed" }]);
 });
 
 test("selection tokens cannot cross sessions or survive mode off and resume", async () => {
@@ -293,7 +542,7 @@ test("selection tokens cannot cross sessions or survive mode off and resume", as
     .getToolByName("conduct_select")!
     .execute("choose", { path: filename });
   const selection = selectionToken(chosen.details);
-  const args = { selection, assignment: "Finish the existing function" };
+  const args = { selection, assignment: "Finish the existing function", files: [filename] };
   const other = await openSession();
   await command(other, "model conduct-test/worker");
   await command(other, "on");
@@ -321,6 +570,7 @@ test("selection tokens cannot cross sessions or survive mode off and resume", as
     resumed.getToolByName("conduct_task")!.execute("resumed", {
       selection: selectionToken(newSelection.details),
       assignment: args.assignment,
+      files: args.files,
     }),
   ).rejects.toThrow("expired selection");
 });

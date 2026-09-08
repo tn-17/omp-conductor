@@ -1,0 +1,3 @@
+Read-only inspection of retained Conduct candidates. Omit `id` to list; supply `id` to read the actual patch, status, exact file scope, and review token. Available while Conduct is off when candidates remain.
+
+Review actual code and correctness; worker reports do not prove success. After reviewing, ask the human to run the exact returned `/conduct apply id reviewToken` command. This tool NEVER applies or approves changes. A changed candidate invalidates old tokens; source edits make it stale. Keep source targets idle during human application. Failed, cancelled, rejected, stale, and applied candidates remain inspectable but are not applicable.
