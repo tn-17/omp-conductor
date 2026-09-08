@@ -11,6 +11,9 @@ import { prompt } from "@oh-my-pi/pi-utils";
 import assignmentTemplate from "./prompts/assignment.md" with { type: "text" };
 import workerPrompt from "./prompts/worker.md" with { type: "text" };
 
+// Post-render formatting would alter significant whitespace in user payloads.
+const renderAssignment = prompt.compile(assignmentTemplate);
+
 export function resolveLocalModel(ctx: ExtensionContext, selector: string): Model {
   const model = ctx.models
     .list()
@@ -97,7 +100,7 @@ export async function runWorker(input: {
   return runSubprocess({
     cwd: ctx.cwd,
     agent,
-    task: prompt.render(assignmentTemplate, { directive, assignment }),
+    task: renderAssignment({ directive, assignment }),
     assignment,
     description: "Conduct local coding assignment",
     index: 0,

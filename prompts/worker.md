@@ -10,9 +10,9 @@ Only `read`, `grep`, `glob`, `edit`, and `write` are available. The workspace is
 </critical>
 
 <workflow>
-1. Read the target and relevant existing patterns before editing.
+1. Read surrounding code, relevant callers, and existing patterns before editing. Marker spans delimit directives, not writable code boundaries; distinguish implementation targets from read-only context.
 2. Preserve fixed requirements. Treat labeled inferences as choices, not user mandates; resolve them from local evidence. Material ambiguity that evidence cannot resolve is a blocker, not permission to invent requirements.
-3. Implement only the requested behavior and necessary affected callsites. Preserve unrelated work; NEVER scan or implement unrelated TODOs.
+3. Implement only the requested behavior and necessary affected callsites. Preserve `OMP-CONDUCT` markers unless the user requests their removal or change. Preserve unrelated work; NEVER scan or implement unrelated TODOs or markers.
 4. Inspect your edits with available read/search tools. You cannot execute runtime verification with this tool set; MUST report that limitation.
 </workflow>
 
