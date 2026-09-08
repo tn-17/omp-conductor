@@ -256,9 +256,195 @@ test("old state defaults fast off and malformed fast restores cannot override it
     workerFast: true,
     advisorFast: 1,
   });
+  for (const workers of [0, 9, 1.5, "2"]) {
+    session.sessionManager.appendCustomEntry("conduct-state", {
+      version: 1,
+      enabled: false,
+      model: "conduct-test/worker",
+      workerFast: true,
+      workers,
+    });
+  }
   await session.extensionRunner!.emit({ type: "session_start" });
   await command(session, "on");
-  expect(savedState(session)).toMatchObject({ workerFast: false, advisorFast: false });
+  expect(savedState(session)).toMatchObject({ workers: 1, workerFast: false, advisorFast: false });
+});
+
+test("worker limit is explicit, bounded, restored, and admits batches only when configured", async () => {
+  const session = await openSession();
+  await command(session, "model conduct-test/worker");
+  await command(session, "on");
+  const batch = session.getToolByName("conduct_batch")!;
+  const task = {
+    directive: "Change target",
+    assignment: "Change only the owned file",
+    context: "Independent constant exports",
+    fixedDecisions: [],
+    acceptance: ["Exported value is two"],
+    files: ["target.ts"],
+  };
+  await expect(
+    batch.execute("default-limit", { tasks: [task, { ...task, files: ["other.ts"] }] }),
+  ).rejects.toThrow("worker limit");
+  await command(session, "workers 2");
+  const configured = savedState(session);
+  for (const value of ["", "0", "9", "1.5", "02", "+2", "2e0", "2 extra"]) {
+    await command(session, `workers ${value}`);
+    expect(savedState(session)).toEqual(configured);
+  }
+  await expect(batch.execute("empty", { tasks: [] })).rejects.toThrow();
+  await expect(
+    batch.execute("hard-cap", { tasks: Array.from({ length: 9 }, () => task) }),
+  ).rejects.toThrow();
+  await command(session, "off");
+  const manager = session.sessionManager;
+  await manager.ensureOnDisk();
+  await manager.flush();
+  const sessionFile = manager.getSessionFile()!;
+  await session.dispose();
+  sessions.splice(sessions.indexOf(session), 1);
+  const resumed = await openSession(await SessionManager.open(sessionFile));
+  await command(resumed, "on");
+  expect(savedState(resumed)).toMatchObject({ workers: 2 });
+  await expect(
+    resumed.getToolByName("conduct_batch")!.execute("restored-limit", {
+      tasks: [task, { ...task, files: ["other.ts"] }, { ...task, files: ["third.ts"] }],
+    }),
+  ).rejects.toThrow("worker limit");
+});
+
+test("batch marker tokens coexist and invocation remains busy through every capture", async () => {
+  const session = await openSession();
+  await command(session, "model conduct-test/worker");
+  await command(session, "workers 2");
+  await command(session, "on");
+  const cwd = session.extensionRunner!.createContext().cwd;
+  const markerFile = path.join(cwd, "directives.ts");
+  await Bun.write(
+    markerFile,
+    "// OMP-CONDUCT BEGIN: first\n// First\n// OMP-CONDUCT END: first\n// OMP-CONDUCT BEGIN: second\n// Second\n// OMP-CONDUCT END: second\n",
+  );
+  await Bun.write(path.join(cwd, "other.ts"), "export const other = 1;\n");
+  const select = session.getToolByName("conduct_select")!;
+  const old = selectionToken(
+    (await select.execute("old", { path: markerFile, marker: "first" })).details,
+  );
+  const first = selectionToken(
+    (await select.execute("first", { path: markerFile, marker: "first" })).details,
+  );
+  const second = selectionToken(
+    (await select.execute("second", { path: markerFile, marker: "second" })).details,
+  );
+  const task = {
+    assignment: "Change only owned export",
+    context: "Independent exports",
+    fixedDecisions: [],
+    acceptance: ["Owned export is two"],
+  };
+  const batch = session.getToolByName("conduct_batch")!;
+  await expect(
+    batch.execute("expired", { tasks: [{ ...task, selection: old, files: ["target.ts"] }] }),
+  ).rejects.toThrow("expired selection");
+  const bothStarted = Promise.withResolvers<void>();
+  const releaseWorkers = Promise.withResolvers<void>();
+  const captureStarted = Promise.withResolvers<void>();
+  const releaseCapture = Promise.withResolvers<void>();
+  const directives: string[] = [];
+  const signals: AbortSignal[] = [];
+  const worker = spyOn(workers, "runWorker").mockImplementation(async (input) => {
+    directives.push(input.directive);
+    signals.push(input.signal);
+    if (directives.length === 2) bothStarted.resolve();
+    await releaseWorkers.promise;
+    await Bun.write(path.join(input.worktree, input.files[0]), "export const value = 2;\n");
+    return {
+      index: 0,
+      id: input.files[0],
+      agent: "conduct-worker",
+      agentSource: "project",
+      task: input.assignment,
+      exitCode: 0,
+      output: "",
+      stderr: "",
+      truncated: false,
+      durationMs: 0,
+      tokens: 0,
+      requests: 0,
+    } satisfies SingleResult;
+  });
+  const finish = candidates.finishCandidate;
+  const capture = spyOn(candidates, "finishCandidate").mockImplementation(async (...args) => {
+    if (args[0].candidate.files.includes("other.ts")) {
+      captureStarted.resolve();
+      await releaseCapture.promise;
+    }
+    return finish(...args);
+  });
+  restores.push(
+    () => worker.mockRestore(),
+    () => capture.mockRestore(),
+  );
+  const tasks = [
+    { ...task, selection: first, files: ["target.ts"] },
+    { ...task, selection: second, files: ["other.ts"] },
+  ];
+  const execution = batch.execute("batch", { tasks });
+  let cancellation: Promise<void> | undefined;
+  try {
+    await bothStarted.promise;
+    expect(directives).toEqual([
+      "// OMP-CONDUCT BEGIN: first\n// First\n// OMP-CONDUCT END: first",
+      "// OMP-CONDUCT BEGIN: second\n// Second\n// OMP-CONDUCT END: second",
+    ]);
+    const before = savedState(session);
+    for (const action of [
+      "workers 3",
+      "fast worker on",
+      "advisor conduct-cloud/worker",
+      "on",
+      "off",
+    ])
+      await command(session, action);
+    expect(savedState(session)).toEqual(before);
+    await expect(
+      session.getToolByName("conduct_task")!.execute("busy", {
+        ...task,
+        directive: "Another",
+        files: ["third.ts"],
+      }),
+    ).rejects.toThrow("already running");
+    releaseWorkers.resolve();
+    await captureStarted.promise;
+    await expect(
+      session.getToolByName("conduct_candidate")!.execute("busy-review", {}),
+    ).rejects.toThrow();
+    let settled = false;
+    void execution.then(() => {
+      settled = true;
+    });
+    cancellation = command(session, "cancel");
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(signals.every((signal) => !signal.aborted)).toBe(true);
+    releaseCapture.resolve();
+    await cancellation;
+    expect(await execution).toMatchObject({
+      isError: false,
+      details: {
+        results: [
+          { details: { status: "ready", candidate: { files: ["target.ts"] } } },
+          { details: { status: "ready", candidate: { files: ["other.ts"] } } },
+        ],
+      },
+    });
+    await expect(batch.execute("consumed", { tasks })).rejects.toThrow("expired selection");
+    expect(await Bun.file(path.join(cwd, "target.ts")).text()).toBe("export const value = 1;\n");
+    expect(await Bun.file(path.join(cwd, "other.ts")).text()).toBe("export const other = 1;\n");
+  } finally {
+    releaseWorkers.resolve();
+    releaseCapture.resolve();
+    await Promise.allSettled([execution, ...(cancellation ? [cancellation] : [])]);
+  }
 });
 
 test("advisor selection is independent, exact, and persists off across resume", async () => {
@@ -558,15 +744,16 @@ test("marker lookup does not dispatch; explicit tokens preserve source and rejec
       acceptance: ["Requested target behavior is implemented"],
       files: [filename],
     }),
-  ).rejects.toThrow("worker-boundary-probe");
+  ).resolves.toMatchObject({ isError: true, details: { status: "failed" } });
   expect(directives).toEqual([directive]);
+  const fresh = await select.execute("fresh", { path: filename, marker: "merge" });
   await Bun.write(
     filename,
     `// OMP-CONDUCT: another task\r\n${directive}\r\nconst humanEdit = true;\r\n`,
   );
   await expect(
     dispatch.execute("stale", {
-      selection,
+      selection: selectionToken(fresh.details),
       assignment: "Implement the named function only",
       context: "Existing target implementation and callers",
       fixedDecisions: ["Preserve unrelated behavior"],
@@ -605,7 +792,7 @@ test("executor tasks preserve significant whitespace in freeform and selected pa
       assignment,
       files: ["target.ts"],
     }),
-  ).rejects.toThrow(stop);
+  ).resolves.toMatchObject({ isError: true, details: { status: "failed" } });
 
   const filename = path.join(session.extensionRunner!.createContext().cwd, "banner.ts");
   await Bun.write(filename, `${directive}\r\n`);
@@ -619,7 +806,7 @@ test("executor tasks preserve significant whitespace in freeform and selected pa
       assignment,
       files: [filename],
     }),
-  ).rejects.toThrow(stop);
+  ).resolves.toMatchObject({ isError: true, details: { status: "failed" } });
 
   expect(tasks).toHaveLength(2);
   for (const task of tasks) {

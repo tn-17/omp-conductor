@@ -205,7 +205,7 @@ async function save(store: string, record: CandidateRecord): Promise<void> {
   await fs.writeFile(temporary, JSON.stringify(record, null, 2), { mode: 0o600 });
   await fs.rename(temporary, filename);
 }
-async function load(store: string, cwd: string, id: string): Promise<CandidateRecord> {
+export async function load(store: string, cwd: string, id: string): Promise<CandidateRecord> {
   const directory = location(store, id);
   const record = JSON.parse(
     await fs.readFile(path.join(directory, "record.json"), "utf8"),
@@ -378,6 +378,31 @@ async function retained(record: CandidateRecord): Promise<Buffer> {
     throw new Error("Candidate has no retained delta");
   return patch;
 }
+export async function resolveCandidateScope(cwdPath: string, requestedFiles: string[]) {
+  const cwd = await fs.realpath(cwdPath);
+  const root = await rootFor(cwd);
+  if (!Array.isArray(requestedFiles) || !requestedFiles.length)
+    throw new Error("Candidate requires exact writable files");
+  const files = [
+    ...new Set(
+      requestedFiles.map((file) => {
+        if (
+          typeof file !== "string" ||
+          !file.trim() ||
+          file.includes("\0") ||
+          file.split(/[\\/]/).includes("..") ||
+          /[*?[\]{}]/.test(file)
+        )
+          throw new Error("Candidate scope must use exact paths without traversal or globs");
+        return relative(root, path.resolve(cwd, file));
+      }),
+    ),
+  ].sort();
+  const sourceStates: Record<string, FileState> = Object.create(null);
+  for (const file of files) sourceStates[file] = await state(root, file);
+  return { cwd, root, files, sourceStates };
+}
+
 export async function prepareCandidate(input: {
   cwd: string;
   storeDir: string;
@@ -415,8 +440,7 @@ export async function prepareCandidate(input: {
     advisorFast: input.brief.advisorFast === true,
     ...(input.brief.advisorModel === undefined ? {} : { advisorModel: input.brief.advisorModel }),
   });
-  const cwd = await fs.realpath(input.cwd);
-  const root = await rootFor(cwd);
+  const { cwd, root, files, sourceStates } = await resolveCandidateScope(input.cwd, input.files);
   const storeDir = path.resolve(input.storeDir);
   if (
     storeDir === root ||
@@ -424,23 +448,6 @@ export async function prepareCandidate(input: {
       path.relative(root, storeDir) !== "..")
   )
     throw new Error("Candidate artifact store must be outside the repository");
-  if (!input.files.length) throw new Error("Candidate requires exact writable files");
-  const files = [
-    ...new Set(
-      input.files.map((file) => {
-        if (
-          !file ||
-          file.includes("\0") ||
-          file.split(/[\\/]/).includes("..") ||
-          /[*?[\]{}]/.test(file)
-        )
-          throw new Error("Candidate scope must use exact paths without traversal or globs");
-        return relative(root, path.resolve(cwd, file));
-      }),
-    ),
-  ].sort();
-  const sourceStates: Record<string, FileState> = Object.create(null);
-  for (const file of files) sourceStates[file] = await state(root, file);
   const id = randomUUID();
   const directory = location(storeDir, id);
   await fs.mkdir(directory, { recursive: true, mode: 0o700 });

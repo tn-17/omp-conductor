@@ -2,7 +2,7 @@
   "name": "omp-conductor",
   "version": "0.1.0",
   "private": true,
-  "description": "Human-directed implementation with one local OMP worker",
+  "description": "Human-directed implementation with bounded local OMP workers",
   "type": "module",
   "scripts": {
     "check": "tsgo --noEmit -p tsconfig.json",

@@ -53,7 +53,7 @@ async function openTestSession(directory: string) {
   return { session, registry };
 }
 
-test.each(["off", "on", "rebuilt"])("worker and advisor policy: %s", async (mode) => {
+test.each(["off", "on", "rebuilt", "error"])("worker and advisor policy: %s", async (mode) => {
   const advisorEnabled = mode !== "off";
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "conduct-worker-policy-"));
   const { session, registry } = await openTestSession(directory);
@@ -334,6 +334,19 @@ test.each(["off", "on", "rebuilt"])("worker and advisor policy: %s", async (mode
         "guarded write",
       );
     }
+    if (mode === "error") {
+      const notices: string[] = [];
+      const stopNotices = child.subscribe((event) => {
+        if (event.type === "notice" && event.source === "advisor") notices.push(event.message);
+      });
+      advisor!.streamFn = () => {
+        throw new Error("500 Internal Server Error: advisor unavailable");
+      };
+      await advisor!.prompt("Review the finished worker before cleanup.");
+      stopNotices();
+      expect(notices).toEqual([]);
+      // Return worker success before the runtime's delayed warning can fire.
+    }
     return {
       id: input.id,
       index: 0,
@@ -379,6 +392,8 @@ test.each(["off", "on", "rebuilt"])("worker and advisor policy: %s", async (mode
     });
     if (mode === "rebuilt") {
       await expect(execution).rejects.toThrow("safety setup is unavailable or changed");
+    } else if (mode === "error") {
+      await expect(execution).rejects.toThrow("advisor unavailable");
     } else {
       await execution;
     }

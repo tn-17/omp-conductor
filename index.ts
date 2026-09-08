@@ -3,14 +3,11 @@ import { parseCommandArgs } from "@oh-my-pi/pi-coding-agent/utils/command-args";
 import { getAgentDir, prompt } from "@oh-my-pi/pi-utils";
 import * as path from "node:path";
 import {
-  prepareCandidate,
-  finishCandidate,
   listCandidates,
   inspectCandidate,
   applyCandidate,
   rejectCandidate,
   recoverCandidates,
-  type PreparedCandidate,
 } from "./candidates";
 import candidateDescription from "./prompts/candidate.md" with { type: "text" };
 import candidateViewTemplate from "./prompts/candidate-view.md" with { type: "text" };
@@ -19,25 +16,26 @@ import conductOff from "./prompts/off.md" with { type: "text" };
 import taskDescription from "./prompts/task.md" with { type: "text" };
 import selectDescription from "./prompts/select.md" with { type: "text" };
 import selectionTemplate from "./prompts/selection.md" with { type: "text" };
-import markerAssignmentTemplate from "./prompts/marker-assignment.md" with { type: "text" };
-import { readMarkerFile, selectMarker, verifySelection, type MarkerSelection } from "./selection";
-import { resolveAdvisorModel, resolveLocalModel, runWorker } from "./worker";
+import { readMarkerFile, selectMarker, type MarkerSelection } from "./selection";
+import { resolveAdvisorModel, resolveLocalModel } from "./worker";
+import { runAssignments, type ConductAssignment, type AssignmentResult } from "./batch";
 
 // Preserve interpolated source and assignment whitespace without post-render formatting.
 const renderCandidateView = prompt.compile(candidateViewTemplate);
 const renderSelection = prompt.compile(selectionTemplate);
-const renderMarkerAssignment = prompt.compile(markerAssignmentTemplate);
 
 const STATE_ENTRY = "conduct-state";
 const TOOL = "conduct_task";
+const BATCH_TOOL = "conduct_batch";
 const SELECT_TOOL = "conduct_select";
 const CANDIDATE_TOOL = "conduct_candidate";
 const USAGE =
-  '/conduct on | off [cancel] | status | model [provider/id] | advisor [off|provider/model-id] | fast [worker|advisor [on|off]] | cancel | markers "file" | select "file" [name|@line] | candidates | review id | apply id reviewToken | reject id';
+  '/conduct on | off [cancel] | status | workers [1..8] | model [provider/id] | advisor [off|provider/model-id] | fast [worker|advisor [on|off]] | cancel | markers "file" | select "file" [name|@line] | candidates | review id | apply id reviewToken | reject id';
 
 interface ConductState {
   version: 1;
   enabled: boolean;
+  workers: number;
   model?: string;
   advisorModel?: string;
   workerFast?: boolean;
@@ -71,9 +69,19 @@ function parseState(data: unknown): ConductState | undefined {
       typeof data.advisorFast !== "boolean")
   )
     return;
+  if (
+    "workers" in data &&
+    data.workers !== undefined &&
+    (typeof data.workers !== "number" ||
+      !Number.isInteger(data.workers) ||
+      data.workers < 1 ||
+      data.workers > 8)
+  )
+    return;
   return {
     version: 1,
     enabled: data.enabled,
+    workers: "workers" in data && typeof data.workers === "number" ? data.workers : 1,
     workerFast: "workerFast" in data && data.workerFast === true,
     advisorFast: "advisorFast" in data && data.advisorFast === true,
     model: "model" in data && typeof data.model === "string" ? data.model : undefined,
@@ -85,10 +93,32 @@ function parseState(data: unknown): ConductState | undefined {
 }
 
 export default function conductExtension(pi: ExtensionAPI): void {
-  let state: ConductState = { version: 1, enabled: false, workerFast: false, advisorFast: false };
+  let state: ConductState = {
+    version: 1,
+    enabled: false,
+    workers: 1,
+    workerFast: false,
+    advisorFast: false,
+  };
   let hasState = false;
   let running: ActiveRun | undefined;
   let selected: MarkerSelection | undefined;
+  const selections = new Map<string, MarkerSelection>();
+
+  function rememberSelection(selection: MarkerSelection): MarkerSelection {
+    for (const [id, previous] of selections) {
+      if (
+        (previous.path === selection.path || previous.realPath === selection.realPath) &&
+        (previous.realPath !== selection.realPath ||
+          previous.digest !== selection.digest ||
+          previous.startLine === selection.startLine)
+      )
+        selections.delete(id);
+    }
+    selected = selection;
+    selections.set(selection.id, selection);
+    return selection;
+  }
   let selectionEpoch = 0;
   let sessionEpoch = 0;
   let operation = false;
@@ -104,16 +134,16 @@ export default function conductExtension(pi: ExtensionAPI): void {
     ctx.ui.setStatus(
       "conduct",
       state.enabled
-        ? `Conduct: on | advisor ${state.advisorModel ?? "off"} | requested fast worker ${state.workerFast === true ? "on" : "off"}, advisor ${state.advisorFast === true ? "on" : "off"}${running ? (running.phase === "worker" ? " | worker running" : " | capturing candidate") : ""}`
+        ? `Conduct: on | workers ${state.workers} | advisor ${state.advisorModel ?? "off"} | requested fast worker ${state.workerFast === true ? "on" : "off"}, advisor ${state.advisorFast === true ? "on" : "off"}${running ? (running.phase === "worker" ? " | invocation running" : " | capturing candidates") : ""}`
         : undefined,
     );
   }
 
   async function syncTool(ctx: ExtensionContext): Promise<void> {
     const active = pi.getActiveTools();
-    const owned = [TOOL, SELECT_TOOL, CANDIDATE_TOOL];
+    const owned = [TOOL, BATCH_TOOL, SELECT_TOOL, CANDIDATE_TOOL];
     const desired = [
-      ...(state.enabled ? [TOOL, SELECT_TOOL] : []),
+      ...(state.enabled ? [TOOL, BATCH_TOOL, SELECT_TOOL] : []),
       ...(state.enabled || retained ? [CANDIDATE_TOOL] : []),
     ];
     await pi.setActiveTools([...active.filter((name) => !owned.includes(name)), ...desired]);
@@ -131,7 +161,8 @@ export default function conductExtension(pi: ExtensionAPI): void {
     assertEpoch(epoch);
     selectionEpoch++;
     selected = undefined;
-    state = { version: 1, enabled: false, workerFast: false, advisorFast: false };
+    selections.clear();
+    state = { version: 1, enabled: false, workers: 1, workerFast: false, advisorFast: false };
     hasState = false;
     for (const entry of ctx.sessionManager.getBranch()) {
       if (entry.type !== "custom" || entry.customType !== STATE_ENTRY) continue;
@@ -249,7 +280,7 @@ export default function conductExtension(pi: ExtensionAPI): void {
           case "status":
             if (rest.length) throw new Error(USAGE);
             ctx.ui.notify(
-              `Conduct ${state.enabled ? "on" : "off"}. Worker: ${state.model ?? "not selected"}. Advisor: ${state.advisorModel ?? "off"}. Requested fast: worker ${state.workerFast === true ? "on" : "off"}; advisor ${state.advisorFast === true ? "on" : "off"}. ${running ? "Worker running." : "Idle."} ${selected ? `Selected: ${selected.path}:${selected.startLine}-${selected.endLine}.` : "No marker selected."} Protected unapplied candidates; explicit human application; no OS sandbox.`,
+              `Conduct ${state.enabled ? "on" : "off"}. Worker: ${state.model ?? "not selected"}. Worker limit: ${state.workers}. Advisor: ${state.advisorModel ?? "off"}. Requested fast: worker ${state.workerFast === true ? "on" : "off"}; advisor ${state.advisorFast === true ? "on" : "off"}. ${running ? "Invocation running." : "Idle."} ${selected ? `Selected: ${selected.path}:${selected.startLine}-${selected.endLine}.` : "No marker selected."} Protected unapplied candidates; explicit human application; no OS sandbox.`,
               "info",
             );
             return;
@@ -281,13 +312,15 @@ export default function conductExtension(pi: ExtensionAPI): void {
             const selector = rest[1];
             if (selector?.startsWith("@") && !/^@[1-9]\d*$/.test(selector))
               throw new Error("Use @ followed by the marker's positive start line.");
-            selected = selectMarker(
-              file,
-              selector?.startsWith("@")
-                ? { line: Number(selector.slice(1)) }
-                : selector === undefined
-                  ? {}
-                  : { marker: selector },
+            selected = rememberSelection(
+              selectMarker(
+                file,
+                selector?.startsWith("@")
+                  ? { line: Number(selector.slice(1)) }
+                  : selector === undefined
+                    ? {}
+                    : { marker: selector },
+              ),
             );
             pi.sendMessage(
               {
@@ -307,6 +340,22 @@ export default function conductExtension(pi: ExtensionAPI): void {
                 },
               },
               { triggerTurn: false },
+            );
+            return;
+          }
+          case "workers": {
+            if (rest.length > 1 || (rest.length === 1 && !/^[1-8]$/.test(rest[0])))
+              throw new Error("Use /conduct workers [1..8]; specify an explicit integer.");
+            if (rest.length) {
+              if (running)
+                throw new Error("Finish or cancel the invocation before changing workers.");
+              state = { ...state, workers: Number(rest[0]) };
+              persist();
+              updateStatus(ctx);
+            }
+            ctx.ui.notify(
+              `Conduct worker limit: ${state.workers}. Batches require independent tasks with disjoint exact writable files; no queue or dependency scheduling.`,
+              "info",
             );
             return;
           }
@@ -363,6 +412,7 @@ export default function conductExtension(pi: ExtensionAPI): void {
             return;
           case "on":
             if (rest.length) throw new Error(USAGE);
+            if (running) throw new Error("Finish or cancel the invocation before changing mode.");
             if (!state.model && !(await selectModel(ctx))) return;
             assertEpoch(epoch);
             resolveLocalModel(ctx, state.model!);
@@ -380,7 +430,7 @@ export default function conductExtension(pi: ExtensionAPI): void {
               throw new Error(USAGE);
             if (running && rest[0] !== "cancel") {
               ctx.ui.notify(
-                "Worker still running. Use /conduct off cancel to preserve its partial candidate and disable the mode, or let it finish first. Source targets remain unchanged.",
+                "Invocation still running. Use /conduct off cancel to cancel all unfinished workers, preserve candidates, and disable the mode, or let it finish first. Source targets remain unchanged.",
                 "warning",
               );
               return;
@@ -388,6 +438,7 @@ export default function conductExtension(pi: ExtensionAPI): void {
             state = { ...state, enabled: false };
             selectionEpoch++;
             selected = undefined;
+            selections.clear();
             persist();
             const outcome = await cancelWorker();
             assertEpoch(epoch);
@@ -395,9 +446,9 @@ export default function conductExtension(pi: ExtensionAPI): void {
             assertEpoch(epoch);
             ctx.ui.notify(
               outcome === "ended"
-                ? "Conduct off. Worker had already ended; candidate capture finished and the candidate remains available for review and rejection. Nothing was applied."
+                ? "Conduct off. Workers had already ended; capture finished and candidates remain available for review and rejection. Nothing was applied."
                 : outcome === "cancelled"
-                  ? "Conduct off. Worker cancelled; partial candidate retained for inspection. Nothing was applied."
+                  ? "Conduct off. Unfinished workers cancelled; candidates retained for inspection. Nothing was applied."
                   : "Conduct off. Retained candidates remain available for review and rejection; nothing was applied.",
               "info",
             );
@@ -406,15 +457,15 @@ export default function conductExtension(pi: ExtensionAPI): void {
           case "cancel": {
             if (rest.length) throw new Error(USAGE);
             if (!running) {
-              ctx.ui.notify("No conduct worker is running.", "info");
+              ctx.ui.notify("No conduct invocation is running.", "info");
               return;
             }
             const outcome = await cancelWorker();
             assertEpoch(epoch);
             ctx.ui.notify(
               outcome === "ended"
-                ? "Worker had already ended. Candidate capture finished and the candidate was retained for inspection; source targets were not applied."
-                : "Worker cancelled. Partial candidate retained for inspection; source targets were not applied.",
+                ? "Workers had already ended. Capture finished and candidates were retained for inspection; source targets were not applied."
+                : "Unfinished workers cancelled. Candidates retained for inspection; source targets were not applied.",
               outcome === "ended" ? "info" : "warning",
             );
             return;
@@ -511,10 +562,12 @@ export default function conductExtension(pi: ExtensionAPI): void {
             details: { path: file.path, markers: file.regions },
           };
         }
-        selected = selectMarker(file, {
-          marker: params.marker ?? undefined,
-          line: params.line ?? undefined,
-        });
+        selected = rememberSelection(
+          selectMarker(file, {
+            marker: params.marker ?? undefined,
+            line: params.line ?? undefined,
+          }),
+        );
         return {
           content: [
             {
@@ -599,6 +652,135 @@ export default function conductExtension(pi: ExtensionAPI): void {
     },
   });
 
+  const taskParameters = pi.typebox.Type.Object({
+    directive: pi.typebox.Type.Optional(
+      pi.typebox.Type.Union([pi.typebox.Type.String({ minLength: 1 }), pi.typebox.Type.Null()], {
+        description: "Freeform user directive, verbatim; null or omitted when using selection",
+      }),
+    ),
+    selection: pi.typebox.Type.Optional(
+      pi.typebox.Type.Union([pi.typebox.Type.String({ minLength: 1 }), pi.typebox.Type.Null()], {
+        description:
+          "Token from conduct_select or /conduct select; null or omitted when using directive",
+      }),
+    ),
+    files: pi.typebox.Type.Array(pi.typebox.Type.String({ minLength: 1 }), {
+      minItems: 1,
+      description:
+        "Exact writable files, relative to cwd or absolute inside the Git repository; no directories or globs",
+    }),
+    assignment: pi.typebox.Type.String({
+      minLength: 1,
+      description: "Bounded implementation task",
+    }),
+    context: pi.typebox.Type.String({
+      minLength: 1,
+      description: "Relevant surrounding code, callers, and read-only context",
+    }),
+    fixedDecisions: pi.typebox.Type.Array(pi.typebox.Type.String({ minLength: 1 }), {
+      description: "Fixed requirements and decisions; empty only when none are fixed",
+    }),
+    acceptance: pi.typebox.Type.Array(pi.typebox.Type.String({ minLength: 1 }), {
+      minItems: 1,
+      description: "Observable conditions the implementation must satisfy",
+    }),
+  });
+
+  type TaskParams = Omit<ConductAssignment, "directive" | "selection"> & {
+    directive?: string | null;
+    selection?: string | null;
+  };
+  type ProgressUpdate = {
+    content: { type: "text"; text: string }[];
+    details: Record<string, unknown>;
+  };
+
+  async function dispatch(
+    tasks: TaskParams[],
+    signal: AbortSignal | undefined,
+    onUpdate: ((update: ProgressUpdate) => void) | undefined,
+    ctx: ExtensionContext,
+  ): Promise<AssignmentResult[]> {
+    if (!state.enabled)
+      throw new Error("Conduct is off. The user must enable /conduct on before dispatch.");
+    if (running)
+      throw new Error(
+        "A conduct invocation is already running. Wait for it to finish before dispatching another.",
+      );
+    if (operation) throw new Error("Another Conduct operation is in progress.");
+    if (!Array.isArray(tasks) || tasks.length < 1 || tasks.length > 8)
+      throw new Error("Provide between 1 and 8 tasks.");
+    if (tasks.length > state.workers)
+      throw new Error(
+        `Batch has ${tasks.length} tasks but the configured worker limit is ${state.workers}. The human must set /conduct workers before dispatch.`,
+      );
+    if (!state.model) throw new Error("Select a worker with /conduct model provider/id.");
+    const assignments = tasks.map((task): ConductAssignment => {
+      if ((task.directive == null) === (task.selection == null))
+        throw new Error("Provide exactly one of directive or selection.");
+      const chosen = task.selection == null ? undefined : selections.get(task.selection);
+      if (task.selection != null && !chosen)
+        throw new Error("Unknown or expired selection. Reselect the directive before dispatch.");
+      return { ...task, directive: task.directive ?? undefined, selection: chosen };
+    });
+    const model = resolveLocalModel(ctx, state.model);
+    const { advisorModel, workerFast, advisorFast } = state;
+    if (advisorModel) resolveAdvisorModel(ctx, advisorModel);
+    const controller = new AbortController();
+    const { promise: done, resolve: finish } = Promise.withResolvers<void>();
+    const active: ActiveRun = { phase: "worker", controller, done, finish };
+    running = active;
+    selectionEpoch++;
+    selections.clear();
+    selected = undefined;
+    updateStatus(ctx);
+    const epoch = sessionEpoch;
+    const runSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+    try {
+      const results = await runAssignments({
+        ctx,
+        storeDir: store(ctx),
+        assignments,
+        model,
+        advisorModel,
+        workerFast,
+        advisorFast,
+        signal: runSignal,
+        onPrepared: () => {
+          retained = true;
+        },
+        onPhase: (phase) => {
+          active.phase = phase;
+          updateStatus(ctx);
+        },
+        onProgress: (index, progress) =>
+          onUpdate?.({
+            content: [
+              {
+                type: "text",
+                text: `Task ${index + 1}/${tasks.length}: local worker ${progress.status}; advisor ${advisorModel ?? "off"}; requested fast worker ${workerFast === true ? "on" : "off"}, advisor ${advisorFast === true ? "on" : "off"}; ${progress.toolCount} tool calls${progress.currentTool ? `; ${progress.currentTool}` : ""}.`,
+              },
+            ],
+            details: {
+              index,
+              count: tasks.length,
+              status: progress.status,
+              model: progress.resolvedModel,
+              advisorModel,
+              workerFast: workerFast === true,
+              advisorFast: advisorFast === true,
+            },
+          }),
+      });
+      assertEpoch(epoch);
+      return results;
+    } finally {
+      if (running === active) running = undefined;
+      active.finish();
+      if (epoch === sessionEpoch) await syncTool(ctx);
+    }
+  }
+
   pi.registerTool({
     name: TOOL,
     label: "Conduct worker",
@@ -606,219 +788,33 @@ export default function conductExtension(pi: ExtensionAPI): void {
     defaultInactive: true,
     loadMode: "essential",
     approval: "write",
+    parameters: taskParameters,
+    async execute(_toolCallId, params, signal, onUpdate, ctx) {
+      const [result] = await dispatch([params], signal, onUpdate, ctx);
+      return result;
+    },
+  });
+
+  pi.registerTool({
+    name: BATCH_TOOL,
+    label: "Conduct worker batch",
+    description: `Run independent Conduct assignments concurrently, returning ordered per-task candidates after all workers and capture finish. Supply tasks using the conduct_task handoff schema. Exact writable ownership must be disjoint, including ancestor paths. The human-configured /conduct workers limit defaults to 1 and cannot exceed 8. No queue, dependencies, automatic apply, or background work. One failed task does not cancel siblings; /conduct cancel cancels all unfinished workers. Review and apply each candidate separately.\n\n${taskDescription}`,
+    defaultInactive: true,
+    loadMode: "essential",
+    approval: "write",
     parameters: pi.typebox.Type.Object({
-      directive: pi.typebox.Type.Optional(
-        pi.typebox.Type.Union([pi.typebox.Type.String({ minLength: 1 }), pi.typebox.Type.Null()], {
-          description: "Freeform user directive, verbatim; null or omitted when using selection",
-        }),
-      ),
-      selection: pi.typebox.Type.Optional(
-        pi.typebox.Type.Union([pi.typebox.Type.String({ minLength: 1 }), pi.typebox.Type.Null()], {
-          description:
-            "Token from conduct_select or /conduct select; null or omitted when using directive",
-        }),
-      ),
-      files: pi.typebox.Type.Array(pi.typebox.Type.String({ minLength: 1 }), {
-        minItems: 1,
-        description:
-          "Exact writable files, relative to cwd or absolute inside the Git repository; no directories or globs",
-      }),
-      assignment: pi.typebox.Type.String({
-        minLength: 1,
-        description: "Bounded implementation task",
-      }),
-      context: pi.typebox.Type.String({
-        minLength: 1,
-        description: "Relevant surrounding code, callers, and read-only context",
-      }),
-      fixedDecisions: pi.typebox.Type.Array(pi.typebox.Type.String({ minLength: 1 }), {
-        description: "Fixed requirements and decisions; empty only when none are fixed",
-      }),
-      acceptance: pi.typebox.Type.Array(pi.typebox.Type.String({ minLength: 1 }), {
-        minItems: 1,
-        description: "Observable conditions the implementation must satisfy",
-      }),
+      tasks: pi.typebox.Type.Array(taskParameters, { minItems: 1, maxItems: 8 }),
     }),
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
-      if (!state.enabled)
-        throw new Error("Conduct is off. The user must enable /conduct on before dispatch.");
-      if (running)
-        throw new Error(
-          "A conduct worker is already running. Wait for it to finish before dispatching another.",
-        );
-      if (operation) throw new Error("Another Conduct operation is in progress.");
-      if (!Array.isArray(params.files) || !params.files.length)
-        throw new Error("Provide files: an explicit nonempty list of exact writable files.");
-      if (!state.model) throw new Error("Select a worker with /conduct model provider/id.");
-      if ((params.directive == null) === (params.selection == null))
-        throw new Error("Provide exactly one of directive or selection.");
-      const meaningful = (value: unknown): value is string =>
-        typeof value === "string" && value.trim().length > 0;
-      if (
-        (params.directive != null && !meaningful(params.directive)) ||
-        !meaningful(params.assignment)
-      )
-        throw new Error("Directive and assignment must contain meaningful text.");
-      if (
-        !meaningful(params.context) ||
-        !Array.isArray(params.fixedDecisions) ||
-        !params.fixedDecisions.every(meaningful) ||
-        !Array.isArray(params.acceptance) ||
-        !params.acceptance.length ||
-        !params.acceptance.every(meaningful)
-      )
-        throw new Error("Provide meaningful context, fixedDecisions, and nonempty acceptance.");
-      const chosen = params.selection == null ? undefined : selected;
-      if (params.selection != null && (!chosen || chosen.id !== params.selection))
-        throw new Error("Unknown or expired selection. Reselect the directive before dispatch.");
-      const model = resolveLocalModel(ctx, state.model);
-      if (state.advisorModel) resolveAdvisorModel(ctx, state.advisorModel);
-      const controller = new AbortController();
-      const { promise: done, resolve: finish } = Promise.withResolvers<void>();
-      const active: ActiveRun = { phase: "worker", controller, done, finish };
-      running = active;
-      selectionEpoch++;
-      updateStatus(ctx);
-      const epoch = sessionEpoch;
-      const storeDir = store(ctx);
-      let prepared: PreparedCandidate | undefined;
-      let finalizationStarted = false;
-      const runSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
-      try {
-        runSignal.throwIfAborted();
-        const directive = chosen ? await verifySelection(chosen) : params.directive!;
-        runSignal.throwIfAborted();
-        assertEpoch(epoch);
-        prepared = await prepareCandidate({
-          cwd: ctx.cwd,
-          storeDir,
-          files: params.files,
-          directive,
-          assignment: params.assignment,
-          brief: {
-            context: params.context,
-            fixedDecisions: params.fixedDecisions,
-            acceptance: params.acceptance,
-            model: `${model.provider}/${model.id}`,
-            advisorModel: state.advisorModel,
-            workerFast: state.workerFast === true,
-            advisorFast: state.advisorFast === true,
-          },
-        });
-        retained = true;
-        assertEpoch(epoch);
-        runSignal.throwIfAborted();
-        let sourcePath: string | undefined;
-        if (chosen) {
-          const source = path.relative(prepared.candidate.root, chosen.realPath);
-          if (source === ".." || source.startsWith(`..${path.sep}`) || path.isAbsolute(source))
-            throw new Error(
-              "Selected source is outside the candidate repository; select a repository source.",
-            );
-          const bytes = await Bun.file(path.join(prepared.worktree, source)).arrayBuffer();
-          assertEpoch(epoch);
-          if (new Bun.CryptoHasher("sha256").update(bytes).digest("hex") !== chosen.digest)
-            throw new Error(
-              "Selected source snapshot mismatch; reselect and review before dispatch.",
-            );
-          sourcePath = path.relative(prepared.workerCwd, path.join(prepared.worktree, source));
-        }
-        const { workerCwd, worktree } = prepared;
-        const assignment = renderMarkerAssignment({
-          path: sourcePath,
-          startLine: chosen?.startLine,
-          endLine: chosen?.endLine,
-          assignment: params.assignment,
-          root: prepared.worktree,
-          cwd: prepared.workerCwd,
-          files: prepared.candidate.files.map((file) => JSON.stringify(file)),
-          cwdFiles: prepared.candidate.files.map((file) =>
-            JSON.stringify(path.relative(workerCwd, path.join(worktree, file))),
-          ),
-        });
-        runSignal.throwIfAborted();
-        const result = await runWorker({
-          ctx,
-          worktree: prepared.workerCwd,
-          root: prepared.worktree,
-          files: [...prepared.candidate.files],
-          brief: prepared.candidate.brief!,
-          model,
-          directive,
-          assignment,
-          signal: runSignal,
-          onProgress: (progress) =>
-            onUpdate?.({
-              content: [
-                {
-                  type: "text",
-                  text: `Local worker ${progress.status}; advisor ${prepared!.candidate.brief!.advisorModel ?? "off"}; requested fast worker ${prepared!.candidate.brief!.workerFast === true ? "on" : "off"}, advisor ${prepared!.candidate.brief!.advisorFast === true ? "on" : "off"}; ${progress.toolCount} tool calls${progress.currentTool ? `; ${progress.currentTool}` : ""}.`,
-                },
-              ],
-              details: {
-                status: progress.status,
-                model: progress.resolvedModel,
-                advisorModel: prepared!.candidate.brief!.advisorModel,
-                workerFast: prepared!.candidate.brief!.workerFast === true,
-                advisorFast: prepared!.candidate.brief!.advisorFast === true,
-              },
-            }),
-        });
-        active.phase = "capture";
-        finalizationStarted = true;
-        updateStatus(ctx);
-        const candidate = await finishCandidate(prepared, {
-          status:
-            result.aborted || runSignal.aborted
-              ? "cancelled"
-              : result.exitCode === 0
-                ? "completed"
-                : "failed",
-          model: result.resolvedModel,
-          id: result.id,
-          outputPath: result.outputPath,
-          error: result.error,
-        });
-        assertEpoch(epoch);
-        return {
-          content: [
-            {
-              type: "text",
-              text: [
-                `Candidate ${candidate.id}: ${candidate.status}. Patch: ${candidate.patchPath}. Model: ${result.resolvedModel ?? state.model}.`,
-                result.output,
-                result.error,
-                result.stderr,
-                "Nothing was applied. Inspect the candidate's actual patch with conduct_candidate, review behavior, then ask the human to run the exact /conduct apply command with its returned review token. Worker reports are not verification.",
-              ]
-                .filter(Boolean)
-                .join("\n\n"),
-            },
-          ],
-          details: {
-            candidate,
-            status: candidate.status,
-            model: result.resolvedModel,
-            id: result.id,
-            outputPath: result.outputPath,
-          },
-          isError: candidate.status !== "ready",
-        };
-      } catch (error) {
-        active.phase = "capture";
-        if (prepared && !finalizationStarted) {
-          updateStatus(ctx);
-          await finishCandidate(prepared, {
-            status: runSignal.aborted ? "cancelled" : "failed",
-            error: error instanceof Error ? error.message : String(error),
-          });
-        }
-        throw error;
-      } finally {
-        if (running === active) running = undefined;
-        active.finish();
-        if (epoch === sessionEpoch) await syncTool(ctx);
-      }
+      const results = await dispatch(params.tasks, signal, onUpdate, ctx);
+      return {
+        content: results.map((result, index) => ({
+          type: "text" as const,
+          text: `Task ${index + 1}/${results.length}\n${result.content.map((item) => item.text).join("\n")}`,
+        })),
+        details: { results },
+        isError: results.some((result) => result.isError),
+      };
     },
   });
 }

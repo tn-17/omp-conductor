@@ -85,6 +85,7 @@ export async function runWorker(input: {
   let child: AgentSession | undefined;
   let advisor: AgentSession["agent"] | undefined;
   let unsubscribe: (() => void) | undefined;
+  let unsubscribeAdvisor: (() => void) | undefined;
   const fail = (message: string) => {
     failure ??= new Error(`Conduct advisor: ${message}`);
     setupAbort.abort(failure);
@@ -246,6 +247,17 @@ export async function runWorker(input: {
             // Keep native filtering, deduplication, severity routing and delivery.
             if (tool === advise) advise.beginUpdate(false);
           };
+          // Native runtime retries can roll back errors without emitting a
+          // warning before worker disposal. Observe the terminal error first.
+          unsubscribeAdvisor = advisor.subscribe((event) => {
+            if (
+              event.type === "message_end" &&
+              event.message.role === "assistant" &&
+              event.message.stopReason === "error"
+            ) {
+              fail(event.message.errorMessage ?? "native advisor provider failed");
+            }
+          });
           unsubscribe = child.subscribe((event) => {
             if (event.type === "notice" && event.source === "advisor" && event.level !== "info") {
               fail(event.message);
@@ -323,6 +335,7 @@ export async function runWorker(input: {
       try {
         await advisor?.waitForIdle();
       } finally {
+        unsubscribeAdvisor?.();
         unsubscribe?.();
       }
     }
