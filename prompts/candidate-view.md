@@ -13,6 +13,8 @@ Patch artifact: {{patchPath}}
 # Structured handoff
 
 Worker advisor: {{#if brief.advisorModel}}{{{brief.advisorModel}}}{{else}}off{{/if}}.
+Requested fast: worker {{#if brief.workerFast}}on{{else}}off{{/if}}; advisor {{#if brief.advisorFast}}on{{else}}off{{/if}}.
+Priority may cost more; providers may ignore or reject the request. Advisor fast does not enable an advisor.
 Advisor advice is not acceptance, verification, or permission to widen scope.
 
 {{#if brief}}

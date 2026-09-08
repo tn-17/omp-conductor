@@ -25,6 +25,8 @@ None specified.
 {{/each}}
 
 Chosen worker model: {{{brief.model}}}
+Pinned requested fast: worker {{#if brief.workerFast}}on{{else}}off{{/if}}; advisor {{#if brief.advisorFast}}on{{else}}off{{/if}}.
+These preferences request a service tier, not guaranteed speed or provider support; advisor fast does not enable an advisor.
 {{#if brief.advisorModel}}
 Pinned read-only worker advisor: {{{brief.advisorModel}}}
 {{else}}

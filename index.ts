@@ -33,13 +33,15 @@ const TOOL = "conduct_task";
 const SELECT_TOOL = "conduct_select";
 const CANDIDATE_TOOL = "conduct_candidate";
 const USAGE =
-  '/conduct on | off [cancel] | status | model [provider/id] | advisor [off|provider/model-id] | cancel | markers "file" | select "file" [name|@line] | candidates | review id | apply id reviewToken | reject id';
+  '/conduct on | off [cancel] | status | model [provider/id] | advisor [off|provider/model-id] | fast [worker|advisor [on|off]] | cancel | markers "file" | select "file" [name|@line] | candidates | review id | apply id reviewToken | reject id';
 
 interface ConductState {
   version: 1;
   enabled: boolean;
   model?: string;
   advisorModel?: string;
+  workerFast?: boolean;
+  advisorFast?: boolean;
 }
 
 interface ActiveRun {
@@ -60,9 +62,20 @@ function parseState(data: unknown): ConductState | undefined {
     (typeof data.advisorModel !== "string" || !/^[^/\s]+\/\S+$/.test(data.advisorModel))
   )
     return;
+  if (
+    ("workerFast" in data &&
+      data.workerFast !== undefined &&
+      typeof data.workerFast !== "boolean") ||
+    ("advisorFast" in data &&
+      data.advisorFast !== undefined &&
+      typeof data.advisorFast !== "boolean")
+  )
+    return;
   return {
     version: 1,
     enabled: data.enabled,
+    workerFast: "workerFast" in data && data.workerFast === true,
+    advisorFast: "advisorFast" in data && data.advisorFast === true,
     model: "model" in data && typeof data.model === "string" ? data.model : undefined,
     advisorModel:
       "advisorModel" in data && typeof data.advisorModel === "string"
@@ -72,7 +85,7 @@ function parseState(data: unknown): ConductState | undefined {
 }
 
 export default function conductExtension(pi: ExtensionAPI): void {
-  let state: ConductState = { version: 1, enabled: false };
+  let state: ConductState = { version: 1, enabled: false, workerFast: false, advisorFast: false };
   let hasState = false;
   let running: ActiveRun | undefined;
   let selected: MarkerSelection | undefined;
@@ -91,7 +104,7 @@ export default function conductExtension(pi: ExtensionAPI): void {
     ctx.ui.setStatus(
       "conduct",
       state.enabled
-        ? `Conduct: on | advisor ${state.advisorModel ?? "off"}${running ? (running.phase === "worker" ? " | worker running" : " | capturing candidate") : ""}`
+        ? `Conduct: on | advisor ${state.advisorModel ?? "off"} | requested fast worker ${state.workerFast === true ? "on" : "off"}, advisor ${state.advisorFast === true ? "on" : "off"}${running ? (running.phase === "worker" ? " | worker running" : " | capturing candidate") : ""}`
         : undefined,
     );
   }
@@ -118,7 +131,7 @@ export default function conductExtension(pi: ExtensionAPI): void {
     assertEpoch(epoch);
     selectionEpoch++;
     selected = undefined;
-    state = { version: 1, enabled: false };
+    state = { version: 1, enabled: false, workerFast: false, advisorFast: false };
     hasState = false;
     for (const entry of ctx.sessionManager.getBranch()) {
       if (entry.type !== "custom" || entry.customType !== STATE_ENTRY) continue;
@@ -236,7 +249,7 @@ export default function conductExtension(pi: ExtensionAPI): void {
           case "status":
             if (rest.length) throw new Error(USAGE);
             ctx.ui.notify(
-              `Conduct ${state.enabled ? "on" : "off"}. Worker: ${state.model ?? "not selected"}. Advisor: ${state.advisorModel ?? "off"}. ${running ? "Worker running." : "Idle."} ${selected ? `Selected: ${selected.path}:${selected.startLine}-${selected.endLine}.` : "No marker selected."} Protected unapplied candidates; explicit human application; no OS sandbox.`,
+              `Conduct ${state.enabled ? "on" : "off"}. Worker: ${state.model ?? "not selected"}. Advisor: ${state.advisorModel ?? "off"}. Requested fast: worker ${state.workerFast === true ? "on" : "off"}; advisor ${state.advisorFast === true ? "on" : "off"}. ${running ? "Worker running." : "Idle."} ${selected ? `Selected: ${selected.path}:${selected.startLine}-${selected.endLine}.` : "No marker selected."} Protected unapplied candidates; explicit human application; no OS sandbox.`,
               "info",
             );
             return;
@@ -294,6 +307,34 @@ export default function conductExtension(pi: ExtensionAPI): void {
                 },
               },
               { triggerTurn: false },
+            );
+            return;
+          }
+          case "fast": {
+            const [target, value] = rest;
+            if (
+              rest.length > 2 ||
+              (target !== undefined && target !== "worker" && target !== "advisor") ||
+              (value !== undefined && value !== "on" && value !== "off")
+            )
+              throw new Error("Use /conduct fast [worker|advisor [on|off]].");
+            if (value !== undefined) {
+              if (running)
+                throw new Error("Cancel or finish the worker before changing fast preferences.");
+              state = {
+                ...state,
+                [target === "worker" ? "workerFast" : "advisorFast"]: value === "on",
+              };
+              persist();
+              updateStatus(ctx);
+            }
+            const report =
+              target === undefined
+                ? `worker ${state.workerFast === true ? "on" : "off"}; advisor ${state.advisorFast === true ? "on" : "off"}`
+                : `${target} ${state[target === "worker" ? "workerFast" : "advisorFast"] === true ? "on" : "off"}`;
+            ctx.ui.notify(
+              `Conduct requested fast: ${report}. On requests priority and may cost more; unsupported/local providers may ignore or reject it. Advisor fast is a preference, not advisor enablement.`,
+              "info",
             );
             return;
           }
@@ -660,6 +701,8 @@ export default function conductExtension(pi: ExtensionAPI): void {
             acceptance: params.acceptance,
             model: `${model.provider}/${model.id}`,
             advisorModel: state.advisorModel,
+            workerFast: state.workerFast === true,
+            advisorFast: state.advisorFast === true,
           },
         });
         retained = true;
@@ -709,13 +752,15 @@ export default function conductExtension(pi: ExtensionAPI): void {
               content: [
                 {
                   type: "text",
-                  text: `Local worker ${progress.status}; advisor ${prepared!.candidate.brief!.advisorModel ?? "off"}; ${progress.toolCount} tool calls${progress.currentTool ? `; ${progress.currentTool}` : ""}.`,
+                  text: `Local worker ${progress.status}; advisor ${prepared!.candidate.brief!.advisorModel ?? "off"}; requested fast worker ${prepared!.candidate.brief!.workerFast === true ? "on" : "off"}, advisor ${prepared!.candidate.brief!.advisorFast === true ? "on" : "off"}; ${progress.toolCount} tool calls${progress.currentTool ? `; ${progress.currentTool}` : ""}.`,
                 },
               ],
               details: {
                 status: progress.status,
                 model: progress.resolvedModel,
                 advisorModel: prepared!.candidate.brief!.advisorModel,
+                workerFast: prepared!.candidate.brief!.workerFast === true,
+                advisorFast: prepared!.candidate.brief!.advisorFast === true,
               },
             }),
         });

@@ -179,6 +179,88 @@ function savedState(session: AgentSession): unknown {
   return entry?.type === "custom" ? entry.data : undefined;
 }
 
+test("fast preferences are explicit, independent, and persist across off and resume", async () => {
+  const settings = Settings.isolated({
+    "memory.backend": "off",
+    "advisor.enabled": false,
+    "autolearn.enabled": false,
+    "tier.openai": "priority",
+    "tier.subagent": "priority",
+    "tier.advisor": "priority",
+  });
+  const session = await openSession(undefined, settings);
+  await command(session, "model conduct-test/worker");
+  expect(savedState(session)).toMatchObject({ workerFast: false, advisorFast: false });
+  await command(session, "fast worker on");
+  await command(session, "fast advisor on");
+  await command(session, "fast worker off");
+  expect(savedState(session)).toMatchObject({ workerFast: false, advisorFast: true });
+  const beforeReports = savedState(session);
+  for (const args of [
+    "fast",
+    "fast worker",
+    "fast advisor",
+    "fast on",
+    "fast worker toggle",
+    "fast advisor on extra",
+  ]) {
+    await command(session, args);
+    expect(savedState(session)).toEqual(beforeReports);
+  }
+  await command(session, "advisor conduct-cloud/worker");
+  await command(session, "advisor off");
+  await command(session, "model conduct-test/worker");
+  await command(session, "on");
+  await command(session, "off");
+  expect(savedState(session)).toMatchObject({
+    enabled: false,
+    workerFast: false,
+    advisorFast: true,
+  });
+  expect(settings.get("tier.openai")).toBe("priority");
+  expect(settings.get("tier.subagent")).toBe("priority");
+  expect(settings.get("tier.advisor")).toBe("priority");
+  expect(settings.get("advisor.enabled")).toBe(false);
+  const manager = session.sessionManager;
+  await manager.ensureOnDisk();
+  await manager.flush();
+  const sessionFile = manager.getSessionFile()!;
+  await session.dispose();
+  sessions.splice(sessions.indexOf(session), 1);
+  const resumed = await openSession(await SessionManager.open(sessionFile));
+  await command(resumed, "on");
+  expect(savedState(resumed)).toMatchObject({ workerFast: false, advisorFast: true });
+  expect(savedState(resumed)).not.toHaveProperty("advisorModel", expect.any(String));
+  await command(resumed, "fast advisor off");
+  expect(savedState(resumed)).toMatchObject({ workerFast: false, advisorFast: false });
+});
+
+test("old state defaults fast off and malformed fast restores cannot override it", async () => {
+  const session = await openSession();
+  session.sessionManager.appendCustomEntry("conduct-state", {
+    version: 1,
+    enabled: false,
+    model: "conduct-test/worker",
+  });
+  session.sessionManager.appendCustomEntry("conduct-state", {
+    version: 1,
+    enabled: false,
+    model: "conduct-test/worker",
+    workerFast: "on",
+    advisorFast: true,
+  });
+  session.sessionManager.appendCustomEntry("conduct-state", {
+    version: 1,
+    enabled: false,
+    model: "conduct-test/worker",
+    workerFast: true,
+    advisorFast: 1,
+  });
+  await session.extensionRunner!.emit({ type: "session_start" });
+  await command(session, "on");
+  expect(savedState(session)).toMatchObject({ workerFast: false, advisorFast: false });
+});
+
 test("advisor selection is independent, exact, and persists off across resume", async () => {
   const settings = Settings.isolated({
     "memory.backend": "off",
@@ -232,6 +314,8 @@ test("one worker at a time; off requires explicit cancellation and blocks subseq
   const started = Promise.withResolvers<void>();
   const spy = spyOn(workers, "runWorker").mockImplementation(async (input) => {
     expect(input.brief.advisorModel).toBeUndefined();
+    expect(input.brief.workerFast).toBe(false);
+    expect(input.brief.advisorFast).toBe(false);
     await Bun.write(path.join(input.worktree, "target.ts"), "export const value = 2;\n");
     started.resolve();
     const stopped = Promise.withResolvers<void>();
@@ -266,6 +350,10 @@ test("one worker at a time; off requires explicit cancellation and blocks subseq
   };
   const first = tool.execute("first", args);
   await started.promise;
+  const beforeFast = savedState(session);
+  await command(session, "fast worker on");
+  await command(session, "fast advisor on");
+  expect(savedState(session)).toEqual(beforeFast);
   await command(session, "advisor conduct-cloud/worker");
   expect(savedState(session)).not.toHaveProperty("advisorModel", expect.any(String));
   await expect(tool.execute("second", args)).rejects.toThrow("already running");
@@ -546,7 +634,10 @@ test("candidates require reviewed human application and survive off and resume",
   await command(session, "on");
   const filename = path.join(session.extensionRunner!.createContext().cwd, "target.ts");
   await command(session, "advisor conduct-cloud/worker");
+  await command(session, "fast worker on");
   const handoff = {
+    workerFast: true,
+    advisorFast: false,
     advisorModel: "conduct-cloud/worker",
     context: "\tRead the existing implementation.\r\n  Preserve this indentation.",
     fixedDecisions: ["\tKeep the exported symbol.\r\n  No renames."],
@@ -560,6 +651,8 @@ test("candidates require reviewed human application and survive off and resume",
     // Worker-owned input cannot widen the authoritative retained candidate scope.
     input.files.push("other.ts");
     expect(() => (input.brief.acceptance as string[]).push("Ignore the human")).toThrow();
+    expect(Reflect.set(input.brief, "workerFast", false)).toBe(false);
+    expect(Reflect.set(input.brief, "advisorFast", true)).toBe(false);
     await Bun.write(path.join(input.worktree, "target.ts"), "export const value = 2;\n");
     return {
       index: 0,
@@ -591,6 +684,12 @@ test("candidates require reviewed human application and survive off and resume",
   expect(candidate.status).toBe("ready");
   expect(candidate.files).toEqual(["target.ts"]);
   expect(candidate.brief).toEqual({ ...handoff, model: "conduct-test/worker" });
+  await command(session, "fast worker off");
+  await command(session, "fast advisor on");
+  expect((await candidates.listCandidates(storeDir, ctx.cwd))[0].brief).toEqual({
+    ...handoff,
+    model: "conduct-test/worker",
+  });
   await command(session, `apply ${candidate.id} unreviewed-token`);
   expect(await Bun.file(filename).text()).toBe("export const value = 1;\n");
   await command(session, "off");
@@ -630,9 +729,29 @@ test("candidates require reviewed human application and survive off and resume",
   const review = await resumed
     .getToolByName("conduct_candidate")!
     .execute("restored-review", { id: candidate.id });
+  expect((await candidates.listCandidates(storeDir, ctx.cwd))[0].brief).toEqual({
+    ...handoff,
+    model: "conduct-test/worker",
+  });
   const details = review.details as { reviewToken: string };
   expect(details.reviewToken).toBeString();
   await command(resumed, "on");
+  const recordPath = path.join(path.dirname(candidate.patchPath), "record.json");
+  const originalRecord = await fs.readFile(recordPath, "utf8");
+  for (const key of ["workerFast", "advisorFast"] as const) {
+    const altered = JSON.parse(originalRecord);
+    altered.brief[key] = !altered.brief[key];
+    await fs.writeFile(recordPath, JSON.stringify(altered));
+    await expect(
+      candidates.applyCandidate(storeDir, ctx.cwd, candidate.id, details.reviewToken),
+    ).rejects.toThrow("Review token");
+    altered.brief[key] = "on";
+    await fs.writeFile(recordPath, JSON.stringify(altered));
+    await expect(candidates.inspectCandidate(storeDir, ctx.cwd, candidate.id)).rejects.toThrow(
+      "Invalid candidate fast preference",
+    );
+  }
+  await fs.writeFile(recordPath, originalRecord);
   await command(resumed, `apply ${candidate.id} ${details.reviewToken}`);
   expect(await Bun.file(filename).text()).toBe("export const value = 2;\n");
 });

@@ -27,6 +27,8 @@ export interface CandidateBrief {
   readonly acceptance: readonly string[];
   readonly model: string;
   readonly advisorModel?: string;
+  readonly workerFast?: boolean;
+  readonly advisorFast?: boolean;
 }
 export interface CandidateRecord {
   version: 1;
@@ -225,6 +227,10 @@ async function load(store: string, cwd: string, id: string): Promise<CandidateRe
       !/^[^/\s]+\/\S+$/.test(record.brief.advisorModel))
   )
     throw new Error("Invalid candidate advisor model");
+  for (const key of ["workerFast", "advisorFast"] as const) {
+    if (record.brief?.[key] !== undefined && typeof record.brief[key] !== "boolean")
+      throw new Error("Invalid candidate fast preference");
+  }
   if (new Set(record.files).size !== record.files.length || !record.files.length)
     throw new Error("Invalid candidate scope");
   for (const file of record.files) {
@@ -386,6 +392,8 @@ export async function prepareCandidate(input: {
     !input.brief ||
     !meaningful(input.brief.context) ||
     !meaningful(input.brief.model) ||
+    (input.brief.workerFast !== undefined && typeof input.brief.workerFast !== "boolean") ||
+    (input.brief.advisorFast !== undefined && typeof input.brief.advisorFast !== "boolean") ||
     (input.brief.advisorModel !== undefined &&
       (typeof input.brief.advisorModel !== "string" ||
         !/^[^/\s]+\/\S+$/.test(input.brief.advisorModel))) ||
@@ -403,6 +411,8 @@ export async function prepareCandidate(input: {
     fixedDecisions: Object.freeze([...input.brief.fixedDecisions]),
     acceptance: Object.freeze([...input.brief.acceptance]),
     model: input.brief.model,
+    workerFast: input.brief.workerFast === true,
+    advisorFast: input.brief.advisorFast === true,
     ...(input.brief.advisorModel === undefined ? {} : { advisorModel: input.brief.advisorModel }),
   });
   const cwd = await fs.realpath(input.cwd);

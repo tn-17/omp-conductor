@@ -30,6 +30,12 @@ Selecting a cloud advisor opts in to disclosing worker snapshot and task data to
 
 The advisor observes progress automatically and can send guidance between implementation steps; no worker-side advisor tool is needed. Silence is not proof of unavailability. Advice is asynchronous and may arrive too late for a short task. The advisor's read/grep/glob use guarded snapshot schemas, not native transports. Provider-side native filesystem bridges are blocked rather than allowed to bypass these guards. Advisor startup or runtime failures fail the candidate instead of silently continuing without the selected advisor.
 
+# Requested fast preferences
+
+`/conduct fast` reports both preferences. `/conduct fast worker` and `/conduct fast advisor` report one without changing it; append explicit `on` or `off` to set it. There are no implicit toggles. Both default off, including older saved state, and never inherit the parent session's tiers. Each candidate pins its preferences immutably; changes affect only future candidates and are forbidden while a run is active.
+
+On requests the native `priority` tier and may cost more; off uses `none` (no service-tier request). These are requests, not guarantees of speed or support: unsupported or local providers may ignore or reject them. No fallback is permitted. Worker and advisor preferences are independent and persist across model changes, Conduct off, and resume. Advisor fast remains configured even when the advisor is disabled; it never enables an advisor. The main session and main advisor settings are unchanged. Change these preferences only with explicit human authorization.
+
 # Marker selection
 
 `/conduct markers "file"` lists markers; `/conduct select "file" [name|@line]` previews one. Omit the selector only for a file with exactly one marker. `conduct_select` provides the same read-only lookup: path alone lists multiple markers or selects the only marker; choose explicitly by `marker` name or `line`, never both. Selection and preview do not dispatch or authorize implementation.

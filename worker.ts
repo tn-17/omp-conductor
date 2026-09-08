@@ -112,6 +112,8 @@ export async function runWorker(input: {
       vision: selector,
       ...(advisorModel ? { advisor: `${advisorModel.provider}/${advisorModel.id}` } : {}),
     },
+    "tier.subagent": input.brief.workerFast === true ? "priority" : "none",
+    "tier.advisor": input.brief.advisorFast === true ? "priority" : "none",
     "task.agentModelOverrides": {},
     "task.agentAdvisor": {},
     "task.agentPrewalk": {},
