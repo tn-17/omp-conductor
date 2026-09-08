@@ -29,7 +29,7 @@ afterEach(async () => {
     await fs.rm(directory, { recursive: true, force: true });
 });
 
-async function openSession(manager?: SessionManager): Promise<AgentSession> {
+async function openSession(manager?: SessionManager, settings?: Settings): Promise<AgentSession> {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "conduct-test-"));
   directories.push(directory);
   const cwd = manager?.getCwd() ?? directory;
@@ -85,11 +85,13 @@ async function openSession(manager?: SessionManager): Promise<AgentSession> {
     modelRegistry: registry,
     model: registry.find("conduct-test", "worker"),
     sessionManager: manager ?? SessionManager.create(directory, path.join(directory, "sessions")),
-    settings: Settings.isolated({
-      "memory.backend": "off",
-      "advisor.enabled": false,
-      "autolearn.enabled": false,
-    }),
+    settings:
+      settings ??
+      Settings.isolated({
+        "memory.backend": "off",
+        "advisor.enabled": false,
+        "autolearn.enabled": false,
+      }),
     disableExtensionDiscovery: true,
     extensions: [conductExtension],
     skills: [],
@@ -169,12 +171,67 @@ test("model selection rejects cloud and fuzzy selectors without replacing the se
   });
 });
 
+function savedState(session: AgentSession): unknown {
+  const entry = session.sessionManager
+    .getBranch()
+    .filter((entry) => entry.type === "custom" && entry.customType === "conduct-state")
+    .at(-1);
+  return entry?.type === "custom" ? entry.data : undefined;
+}
+
+test("advisor selection is independent, exact, and persists off across resume", async () => {
+  const settings = Settings.isolated({
+    "memory.backend": "off",
+    "advisor.enabled": true,
+    modelRoles: { advisor: "conduct-test/worker" },
+    "autolearn.enabled": false,
+  });
+  const session = await openSession(undefined, settings);
+  await command(session, "model conduct-test/worker");
+  expect(savedState(session)).not.toHaveProperty("advisorModel", expect.any(String));
+  await command(session, "advisor conduct-cloud/worker");
+  expect(savedState(session)).toMatchObject({
+    model: "conduct-test/worker",
+    advisorModel: "conduct-cloud/worker",
+  });
+  await command(session, "advisor worker");
+  await command(session, "advisor conduct-cloud/missing");
+  expect(savedState(session)).toMatchObject({ advisorModel: "conduct-cloud/worker" });
+  expect(settings.get("advisor.enabled")).toBe(true);
+  expect(settings.get("modelRoles")).toEqual({ advisor: "conduct-test/worker" });
+  expect(session.model?.provider).toBe("conduct-test");
+  await command(session, "on");
+  await command(session, "off");
+  expect(savedState(session)).toMatchObject({
+    enabled: false,
+    advisorModel: "conduct-cloud/worker",
+  });
+  const manager = session.sessionManager;
+  await manager.ensureOnDisk();
+  await manager.flush();
+  const sessionFile = manager.getSessionFile()!;
+  await session.dispose();
+  sessions.splice(sessions.indexOf(session), 1);
+  const resumed = await openSession(await SessionManager.open(sessionFile));
+  await command(resumed, "on");
+  expect(savedState(resumed)).toMatchObject({ advisorModel: "conduct-cloud/worker" });
+  await command(resumed, "advisor off");
+  await command(resumed, "off");
+  await resumed.sessionManager.flush();
+  await resumed.dispose();
+  sessions.splice(sessions.indexOf(resumed), 1);
+  const offResumed = await openSession(await SessionManager.open(sessionFile));
+  await command(offResumed, "on");
+  expect(savedState(offResumed)).not.toHaveProperty("advisorModel", expect.any(String));
+});
+
 test("one worker at a time; off requires explicit cancellation and blocks subsequent dispatch", async () => {
   const session = await openSession();
   await command(session, "model conduct-test/worker");
   await command(session, "on");
   const started = Promise.withResolvers<void>();
   const spy = spyOn(workers, "runWorker").mockImplementation(async (input) => {
+    expect(input.brief.advisorModel).toBeUndefined();
     await Bun.write(path.join(input.worktree, "target.ts"), "export const value = 2;\n");
     started.resolve();
     const stopped = Promise.withResolvers<void>();
@@ -209,6 +266,8 @@ test("one worker at a time; off requires explicit cancellation and blocks subseq
   };
   const first = tool.execute("first", args);
   await started.promise;
+  await command(session, "advisor conduct-cloud/worker");
+  expect(savedState(session)).not.toHaveProperty("advisorModel", expect.any(String));
   await expect(tool.execute("second", args)).rejects.toThrow("already running");
   await command(session, "off");
   expect(session.getActiveToolNames()).toContain("conduct_task");
@@ -486,7 +545,9 @@ test("candidates require reviewed human application and survive off and resume",
   await command(session, "model conduct-test/worker");
   await command(session, "on");
   const filename = path.join(session.extensionRunner!.createContext().cwd, "target.ts");
+  await command(session, "advisor conduct-cloud/worker");
   const handoff = {
+    advisorModel: "conduct-cloud/worker",
     context: "\tRead the existing implementation.\r\n  Preserve this indentation.",
     fixedDecisions: ["\tKeep the exported symbol.\r\n  No renames."],
     acceptance: ["\tThe exported value is two.\r\n  Other behavior is unchanged."],
@@ -552,6 +613,7 @@ test("candidates require reviewed human application and survive off and resume",
     ...handoff.fixedDecisions,
     ...handoff.acceptance,
     "conduct-test/worker",
+    "conduct-cloud/worker",
   ])
     expect(reviewText).toContain(value);
   const inspected = await candidates.inspectCandidate(storeDir, ctx.cwd, candidate.id);

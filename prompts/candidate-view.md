@@ -12,6 +12,9 @@ Patch artifact: {{patchPath}}
 
 # Structured handoff
 
+Worker advisor: {{#if brief.advisorModel}}{{{brief.advisorModel}}}{{else}}off{{/if}}.
+Advisor advice is not acceptance, verification, or permission to widen scope.
+
 {{#if brief}}
 Chosen worker model: {{{brief.model}}}
 

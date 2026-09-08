@@ -25,3 +25,8 @@ None specified.
 {{/each}}
 
 Chosen worker model: {{{brief.model}}}
+{{#if brief.advisorModel}}
+Pinned read-only worker advisor: {{{brief.advisorModel}}}
+{{else}}
+Worker advisor: off.
+{{/if}}

@@ -21,7 +21,7 @@ import selectDescription from "./prompts/select.md" with { type: "text" };
 import selectionTemplate from "./prompts/selection.md" with { type: "text" };
 import markerAssignmentTemplate from "./prompts/marker-assignment.md" with { type: "text" };
 import { readMarkerFile, selectMarker, verifySelection, type MarkerSelection } from "./selection";
-import { resolveLocalModel, runWorker } from "./worker";
+import { resolveAdvisorModel, resolveLocalModel, runWorker } from "./worker";
 
 // Preserve interpolated source and assignment whitespace without post-render formatting.
 const renderCandidateView = prompt.compile(candidateViewTemplate);
@@ -33,12 +33,13 @@ const TOOL = "conduct_task";
 const SELECT_TOOL = "conduct_select";
 const CANDIDATE_TOOL = "conduct_candidate";
 const USAGE =
-  '/conduct on | off [cancel] | status | model [provider/id] | cancel | markers "file" | select "file" [name|@line] | candidates | review id | apply id reviewToken | reject id';
+  '/conduct on | off [cancel] | status | model [provider/id] | advisor [off|provider/model-id] | cancel | markers "file" | select "file" [name|@line] | candidates | review id | apply id reviewToken | reject id';
 
 interface ConductState {
   version: 1;
   enabled: boolean;
   model?: string;
+  advisorModel?: string;
 }
 
 interface ActiveRun {
@@ -53,10 +54,20 @@ function parseState(data: unknown): ConductState | undefined {
   if (!("version" in data) || data.version !== 1) return;
   if (!("enabled" in data) || typeof data.enabled !== "boolean") return;
   if ("model" in data && data.model !== undefined && typeof data.model !== "string") return;
+  if (
+    "advisorModel" in data &&
+    data.advisorModel !== undefined &&
+    (typeof data.advisorModel !== "string" || !/^[^/\s]+\/\S+$/.test(data.advisorModel))
+  )
+    return;
   return {
     version: 1,
     enabled: data.enabled,
     model: "model" in data && typeof data.model === "string" ? data.model : undefined,
+    advisorModel:
+      "advisorModel" in data && typeof data.advisorModel === "string"
+        ? data.advisorModel
+        : undefined,
   };
 }
 
@@ -80,7 +91,7 @@ export default function conductExtension(pi: ExtensionAPI): void {
     ctx.ui.setStatus(
       "conduct",
       state.enabled
-        ? `Conduct: on${running ? (running.phase === "worker" ? " | worker running" : " | capturing candidate") : ""}`
+        ? `Conduct: on | advisor ${state.advisorModel ?? "off"}${running ? (running.phase === "worker" ? " | worker running" : " | capturing candidate") : ""}`
         : undefined,
     );
   }
@@ -225,7 +236,7 @@ export default function conductExtension(pi: ExtensionAPI): void {
           case "status":
             if (rest.length) throw new Error(USAGE);
             ctx.ui.notify(
-              `Conduct ${state.enabled ? "on" : "off"}. Worker: ${state.model ?? "not selected"}. ${running ? "Worker running." : "Idle."} ${selected ? `Selected: ${selected.path}:${selected.startLine}-${selected.endLine}.` : "No marker selected."} Protected unapplied candidates; explicit human application; no OS sandbox.`,
+              `Conduct ${state.enabled ? "on" : "off"}. Worker: ${state.model ?? "not selected"}. Advisor: ${state.advisorModel ?? "off"}. ${running ? "Worker running." : "Idle."} ${selected ? `Selected: ${selected.path}:${selected.startLine}-${selected.endLine}.` : "No marker selected."} Protected unapplied candidates; explicit human application; no OS sandbox.`,
               "info",
             );
             return;
@@ -286,6 +297,24 @@ export default function conductExtension(pi: ExtensionAPI): void {
             );
             return;
           }
+          case "advisor":
+            if (rest.length > 1) throw new Error(USAGE);
+            if (rest.length) {
+              if (running)
+                throw new Error("Cancel or finish the worker before changing its advisor.");
+              const advisor = rest[0] === "off" ? undefined : resolveAdvisorModel(ctx, rest[0]);
+              state = {
+                ...state,
+                advisorModel: advisor ? `${advisor.provider}/${advisor.id}` : undefined,
+              };
+              persist();
+              updateStatus(ctx);
+            }
+            ctx.ui.notify(
+              `Conduct worker advisor: ${state.advisorModel ?? "off"}.${state.advisorModel ? " Opt-in advisor access may disclose worker snapshot and task data to the selected provider. Advice does not approve changes or widen scope." : ""}`,
+              state.advisorModel ? "warning" : "info",
+            );
+            return;
           case "model":
             if (rest.length > 1) throw new Error(USAGE);
             if (await selectModel(ctx, rest[0]))
@@ -602,6 +631,7 @@ export default function conductExtension(pi: ExtensionAPI): void {
       if (params.selection != null && (!chosen || chosen.id !== params.selection))
         throw new Error("Unknown or expired selection. Reselect the directive before dispatch.");
       const model = resolveLocalModel(ctx, state.model);
+      if (state.advisorModel) resolveAdvisorModel(ctx, state.advisorModel);
       const controller = new AbortController();
       const { promise: done, resolve: finish } = Promise.withResolvers<void>();
       const active: ActiveRun = { phase: "worker", controller, done, finish };
@@ -629,6 +659,7 @@ export default function conductExtension(pi: ExtensionAPI): void {
             fixedDecisions: params.fixedDecisions,
             acceptance: params.acceptance,
             model: `${model.provider}/${model.id}`,
+            advisorModel: state.advisorModel,
           },
         });
         retained = true;
@@ -678,10 +709,14 @@ export default function conductExtension(pi: ExtensionAPI): void {
               content: [
                 {
                   type: "text",
-                  text: `Local worker ${progress.status}; ${progress.toolCount} tool calls${progress.currentTool ? `; ${progress.currentTool}` : ""}.`,
+                  text: `Local worker ${progress.status}; advisor ${prepared!.candidate.brief!.advisorModel ?? "off"}; ${progress.toolCount} tool calls${progress.currentTool ? `; ${progress.currentTool}` : ""}.`,
                 },
               ],
-              details: { status: progress.status, model: progress.resolvedModel },
+              details: {
+                status: progress.status,
+                model: progress.resolvedModel,
+                advisorModel: prepared!.candidate.brief!.advisorModel,
+              },
             }),
         });
         active.phase = "capture";

@@ -26,6 +26,7 @@ export interface CandidateBrief {
   readonly fixedDecisions: readonly string[];
   readonly acceptance: readonly string[];
   readonly model: string;
+  readonly advisorModel?: string;
 }
 export interface CandidateRecord {
   version: 1;
@@ -218,6 +219,12 @@ async function load(store: string, cwd: string, id: string): Promise<CandidateRe
     !record.baseline
   )
     throw new Error("Invalid candidate identity or repository");
+  if (
+    record.brief?.advisorModel !== undefined &&
+    (typeof record.brief.advisorModel !== "string" ||
+      !/^[^/\s]+\/\S+$/.test(record.brief.advisorModel))
+  )
+    throw new Error("Invalid candidate advisor model");
   if (new Set(record.files).size !== record.files.length || !record.files.length)
     throw new Error("Invalid candidate scope");
   for (const file of record.files) {
@@ -379,6 +386,9 @@ export async function prepareCandidate(input: {
     !input.brief ||
     !meaningful(input.brief.context) ||
     !meaningful(input.brief.model) ||
+    (input.brief.advisorModel !== undefined &&
+      (typeof input.brief.advisorModel !== "string" ||
+        !/^[^/\s]+\/\S+$/.test(input.brief.advisorModel))) ||
     !Array.isArray(input.brief.fixedDecisions) ||
     !input.brief.fixedDecisions.every(meaningful) ||
     !Array.isArray(input.brief.acceptance) ||
@@ -393,6 +403,7 @@ export async function prepareCandidate(input: {
     fixedDecisions: Object.freeze([...input.brief.fixedDecisions]),
     acceptance: Object.freeze([...input.brief.acceptance]),
     model: input.brief.model,
+    ...(input.brief.advisorModel === undefined ? {} : { advisorModel: input.brief.advisorModel }),
   });
   const cwd = await fs.realpath(input.cwd);
   const root = await rootFor(cwd);
