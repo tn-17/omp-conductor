@@ -2,6 +2,8 @@
 
 Conduct turns explicitly requested, deferred implementation into bounded local worker assignments. Human directives may be freeform comments, pseudocode, or partial code.
 
+In the interactive editor, type `/conduct ` and use Tab to open the option preview. Options include descriptions and argument usage; typing a prefix filters them. Completion inserts only the subcommand, never executes it or supplies candidate IDs or review tokens.
+
 <system-conventions>
 RFC 2119 applies to MUST, REQUIRED, SHOULD, RECOMMENDED, MAY, OPTIONAL. NEVER = MUST NOT; AVOID = SHOULD NOT.
 </system-conventions>

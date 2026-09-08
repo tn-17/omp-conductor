@@ -220,8 +220,60 @@ export default function conductExtension(pi: ExtensionAPI): void {
     return true;
   }
 
+  const commandOptions = [
+    { name: "on", description: "Enable Conduct mode" },
+    {
+      name: "off",
+      description: "Disable Conduct; optionally cancel active work",
+      hint: "[cancel]",
+    },
+    { name: "status", description: "Show Conduct configuration and activity" },
+    { name: "workers", description: "Show or set the worker limit", hint: "[1..8]" },
+    { name: "model", description: "Choose the local worker model", hint: "[provider/id]" },
+    {
+      name: "advisor",
+      description: "Show, choose, or disable the worker advisor",
+      hint: "[off|provider/model-id]",
+    },
+    {
+      name: "fast",
+      description: "Show or set independent priority preferences",
+      hint: "[worker|advisor [on|off]]",
+    },
+    { name: "cancel", description: "Cancel unfinished workers and await candidate capture" },
+    { name: "markers", description: "List deferred directives in a file", hint: '"file"' },
+    {
+      name: "select",
+      description: "Preview a deferred directive without dispatching",
+      hint: '"file" [name|@line]',
+    },
+    { name: "candidates", description: "List retained candidates" },
+    {
+      name: "review",
+      description: "Inspect a candidate patch and obtain its review token",
+      hint: "id",
+    },
+    {
+      name: "apply",
+      description: "Apply an explicitly reviewed candidate",
+      hint: "id reviewToken",
+    },
+    { name: "reject", description: "Reject a retained candidate", hint: "id" },
+  ];
   pi.registerCommand("conduct", {
     description: "Prepare protected local-worker candidates; review and explicitly apply them",
+    getArgumentCompletions: (argumentPrefix) => {
+      if (/\s/.test(argumentPrefix)) return null;
+      const prefix = argumentPrefix.toLowerCase();
+      const matches = commandOptions
+        .filter((option) => option.name.startsWith(prefix))
+        .map((option) => ({
+          value: `${option.name} `,
+          label: option.name,
+          description: option.hint ? `${option.description} — ${option.hint}` : option.description,
+        }));
+      return matches.length ? matches : null;
+    },
     handler: async (args, ctx) => {
       const [action = "status", ...rest] = parseCommandArgs(args);
       if (operation) {
