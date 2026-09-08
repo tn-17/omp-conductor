@@ -202,8 +202,6 @@ export default function conductExtension(pi: ExtensionAPI): void {
                   customType: "conduct-candidate",
                   content: renderCandidateView({
                     ...view.candidate,
-                    directiveLines: view.candidate.directive.split(/\r?\n/),
-                    assignmentLines: view.candidate.assignment.split(/\r?\n/),
                     patchLines: view.patch.split(/\r?\n/),
                     approval: view.reviewToken
                       ? `/conduct apply ${view.candidate.id} ${view.reviewToken}`
@@ -502,8 +500,6 @@ export default function conductExtension(pi: ExtensionAPI): void {
                 type: "text",
                 text: renderCandidateView({
                   ...view.candidate,
-                  directiveLines: view.candidate.directive.split(/\r?\n/),
-                  assignmentLines: view.candidate.assignment.split(/\r?\n/),
                   patchLines: view.patch.split(/\r?\n/),
                   approval: view.reviewToken
                     ? `/conduct apply ${view.candidate.id} ${view.reviewToken}`
@@ -559,8 +555,18 @@ export default function conductExtension(pi: ExtensionAPI): void {
       }),
       assignment: pi.typebox.Type.String({
         minLength: 1,
-        description:
-          "Bounded target, relevant context, fixed/inferred decisions, and expected behavior",
+        description: "Bounded implementation task",
+      }),
+      context: pi.typebox.Type.String({
+        minLength: 1,
+        description: "Relevant surrounding code, callers, and read-only context",
+      }),
+      fixedDecisions: pi.typebox.Type.Array(pi.typebox.Type.String({ minLength: 1 }), {
+        description: "Fixed requirements and decisions; empty only when none are fixed",
+      }),
+      acceptance: pi.typebox.Type.Array(pi.typebox.Type.String({ minLength: 1 }), {
+        minItems: 1,
+        description: "Observable conditions the implementation must satisfy",
       }),
     }),
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
@@ -576,8 +582,22 @@ export default function conductExtension(pi: ExtensionAPI): void {
       if (!state.model) throw new Error("Select a worker with /conduct model provider/id.");
       if ((params.directive == null) === (params.selection == null))
         throw new Error("Provide exactly one of directive or selection.");
-      if ((params.directive != null && !params.directive.trim()) || !params.assignment.trim())
+      const meaningful = (value: unknown): value is string =>
+        typeof value === "string" && value.trim().length > 0;
+      if (
+        (params.directive != null && !meaningful(params.directive)) ||
+        !meaningful(params.assignment)
+      )
         throw new Error("Directive and assignment must contain meaningful text.");
+      if (
+        !meaningful(params.context) ||
+        !Array.isArray(params.fixedDecisions) ||
+        !params.fixedDecisions.every(meaningful) ||
+        !Array.isArray(params.acceptance) ||
+        !params.acceptance.length ||
+        !params.acceptance.every(meaningful)
+      )
+        throw new Error("Provide meaningful context, fixedDecisions, and nonempty acceptance.");
       const chosen = params.selection == null ? undefined : selected;
       if (params.selection != null && (!chosen || chosen.id !== params.selection))
         throw new Error("Unknown or expired selection. Reselect the directive before dispatch.");
@@ -604,6 +624,12 @@ export default function conductExtension(pi: ExtensionAPI): void {
           files: params.files,
           directive,
           assignment: params.assignment,
+          brief: {
+            context: params.context,
+            fixedDecisions: params.fixedDecisions,
+            acceptance: params.acceptance,
+            model: `${model.provider}/${model.id}`,
+          },
         });
         retained = true;
         assertEpoch(epoch);
@@ -623,17 +649,26 @@ export default function conductExtension(pi: ExtensionAPI): void {
             );
           sourcePath = path.relative(prepared.workerCwd, path.join(prepared.worktree, source));
         }
+        const { workerCwd, worktree } = prepared;
         const assignment = renderMarkerAssignment({
           path: sourcePath,
           startLine: chosen?.startLine,
           endLine: chosen?.endLine,
           assignment: params.assignment,
+          root: prepared.worktree,
+          cwd: prepared.workerCwd,
           files: prepared.candidate.files.map((file) => JSON.stringify(file)),
+          cwdFiles: prepared.candidate.files.map((file) =>
+            JSON.stringify(path.relative(workerCwd, path.join(worktree, file))),
+          ),
         });
         runSignal.throwIfAborted();
         const result = await runWorker({
           ctx,
           worktree: prepared.workerCwd,
+          root: prepared.worktree,
+          files: [...prepared.candidate.files],
+          brief: prepared.candidate.brief!,
           model,
           directive,
           assignment,

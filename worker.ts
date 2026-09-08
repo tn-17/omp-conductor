@@ -3,6 +3,7 @@ import {
   type AgentDefinition,
   type AgentProgress,
   type ExtensionContext,
+  type PreparedExtension,
   runSubprocess,
   Settings,
   type SingleResult,
@@ -10,6 +11,8 @@ import {
 import { prompt } from "@oh-my-pi/pi-utils";
 import assignmentTemplate from "./prompts/assignment.md" with { type: "text" };
 import workerPrompt from "./prompts/worker.md" with { type: "text" };
+import type { CandidateBrief } from "./candidates";
+import { createWorkerTools } from "./worker-tools";
 
 // Post-render formatting would alter significant whitespace in user payloads.
 const renderAssignment = prompt.compile(assignmentTemplate);
@@ -44,6 +47,9 @@ export async function runWorker(input: {
   model: Model;
   directive: string;
   assignment: string;
+  brief: CandidateBrief;
+  root: string;
+  files: string[];
   worktree: string;
   signal: AbortSignal;
   onProgress: (progress: AgentProgress) => void;
@@ -57,7 +63,7 @@ export async function runWorker(input: {
     description: "Local coding worker executing the frontier's bounded assignment",
     systemPrompt: workerPrompt,
     source: "project",
-    tools: ["read", "grep", "glob", "edit", "write"],
+    tools: [],
     model: [selector],
     spawns: [],
     advisor: false,
@@ -98,13 +104,39 @@ export async function runWorker(input: {
     "edit.blackbox.enabled": false,
     "magicKeywords.enabled": false,
   });
+  const customTools = await createWorkerTools({
+    root: input.root,
+    cwd: input.worktree,
+    files: [...input.files],
+    settings,
+  });
+  agent.tools = customTools.map((tool) => tool.name);
+  const allowedTools = new Set([...agent.tools, "yield"]);
+  const policy: PreparedExtension = {
+    path: "<conduct-worker-policy>",
+    resolvedPath: "<conduct-worker-policy>",
+    error: null,
+    factory(pi) {
+      pi.on("before_agent_start", () => {
+        pi.setActiveTools([...allowedTools]);
+      });
+      pi.on("tool_call", (event) => {
+        if (!allowedTools.has(event.toolName)) {
+          return {
+            block: true,
+            reason: `Conduct worker cannot use ${event.toolName}. Use the guarded snapshot tools; request fresh human-authorized scope instead of bypassing restrictions.`,
+          };
+        }
+      });
+    },
+  };
   let deferredCleanup: Promise<void> | undefined;
   try {
     return await runSubprocess({
       cwd: ctx.cwd,
       worktree: input.worktree,
       agent,
-      task: renderAssignment({ directive, assignment }),
+      task: renderAssignment({ directive, assignment, brief: input.brief }),
       assignment,
       description: "Conduct local coding assignment",
       index: 0,
@@ -116,9 +148,25 @@ export async function runWorker(input: {
       enableIrc: false,
       enableLsp: false,
       enableMCP: false,
-      restrictToolNames: true,
+      // OMP's restricted-host mode drops custom tools. The explicit policy
+      // extension instead gates every call, including dynamically added tools.
+      restrictToolNames: false,
+      customTools,
+      context: "",
+      contextFiles: [],
+      skills: [],
+      rules: [],
+      promptTemplates: [],
+      preloadedExtensionPaths: [],
+      preloadedPreparedExtensions: [policy],
+      preloadedCustomToolPaths: [],
+      extensionRoots: () => ({
+        explicit: [],
+        mode: "explicit-only",
+        configured: [],
+        configuredLevel: "project",
+      }),
       artifactsDir: ctx.sessionManager.getArtifactsDir() ?? undefined,
-      localProtocolOptions: ctx.localProtocolOptions,
       signal,
       onProgress,
       onCleanupDeferred: (completion) => {

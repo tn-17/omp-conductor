@@ -5,8 +5,15 @@ The original directive was extracted from snapshot cwd-relative source {{{path}}
 Frontier assignment:
 {{{assignment}}}
 
-Exact writable files (repository-relative):
+Snapshot root: {{{root}}}
+Tool working directory: {{{cwd}}}
+
+Exact writable files (snapshot-root-relative):
 {{#each files}}
 {{{this}}}
 {{/each}}
-All other files are read-only context.
+The same exact writable files, relative to the tool working directory:
+{{#each cwdFiles}}
+{{{this}}}
+{{/each}}
+All other files are read-only context. Only paths inside this snapshot are accessible.

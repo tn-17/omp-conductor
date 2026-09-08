@@ -202,6 +202,9 @@ test("one worker at a time; off requires explicit cancellation and blocks subseq
   const args = {
     directive: "Complete this function",
     assignment: "Only fill its existing body",
+    context: "Existing target implementation and callers",
+    fixedDecisions: ["Preserve unrelated behavior"],
+    acceptance: ["Requested target behavior is implemented"],
     files: ["target.ts"],
   };
   const first = tool.execute("first", args);
@@ -269,6 +272,9 @@ test.each(["cancel", "off cancel"])(
     const execution = session.getToolByName("conduct_task")!.execute("capture", {
       directive: "Change value to two",
       assignment: "Only target.ts",
+      context: "Existing target implementation and callers",
+      fixedDecisions: ["Preserve unrelated behavior"],
+      acceptance: ["Requested target behavior is implemented"],
       files: ["target.ts"],
     });
     let cancellation: Promise<void> | undefined;
@@ -328,6 +334,38 @@ function selectionToken(details: unknown): string {
   return details.selection;
 }
 
+test("incomplete structured handoffs fail before snapshot creation", async () => {
+  const session = await openSession();
+  await command(session, "model conduct-test/worker");
+  await command(session, "on");
+  const prepare = spyOn(candidates, "prepareCandidate").mockImplementation(async () => {
+    throw new Error("must not create a snapshot");
+  });
+  restores.push(() => prepare.mockRestore());
+  const args = {
+    directive: "Change value to two",
+    assignment: "Only target.ts",
+    files: ["target.ts"],
+    context: "Existing implementation",
+    fixedDecisions: [],
+    acceptance: ["Exported value is two"],
+  };
+  for (const invalid of [
+    { context: undefined },
+    { context: " \r\n\t" },
+    { fixedDecisions: undefined },
+    { fixedDecisions: [" "] },
+    { acceptance: undefined },
+    { acceptance: [] },
+    { acceptance: ["\t"] },
+  ]) {
+    await expect(
+      session.getToolByName("conduct_task")!.execute("invalid", { ...args, ...invalid }),
+    ).rejects.toThrow();
+  }
+  expect(prepare).not.toHaveBeenCalled();
+});
+
 test("marker lookup does not dispatch; explicit tokens preserve source and reject stale intent", async () => {
   const session = await openSession();
   await command(session, "model conduct-test/worker");
@@ -357,6 +395,9 @@ test("marker lookup does not dispatch; explicit tokens preserve source and rejec
       selection,
       directive: "replacement",
       assignment: "Keep scope",
+      context: "Existing target implementation and callers",
+      fixedDecisions: ["Preserve unrelated behavior"],
+      acceptance: ["Requested target behavior is implemented"],
       files: [filename],
     }),
   ).rejects.toThrow("exactly one");
@@ -365,6 +406,9 @@ test("marker lookup does not dispatch; explicit tokens preserve source and rejec
       selection,
       directive: null,
       assignment: "Implement the named function only",
+      context: "Existing target implementation and callers",
+      fixedDecisions: ["Preserve unrelated behavior"],
+      acceptance: ["Requested target behavior is implemented"],
       files: [filename],
     }),
   ).rejects.toThrow("worker-boundary-probe");
@@ -377,6 +421,9 @@ test("marker lookup does not dispatch; explicit tokens preserve source and rejec
     dispatch.execute("stale", {
       selection,
       assignment: "Implement the named function only",
+      context: "Existing target implementation and callers",
+      fixedDecisions: ["Preserve unrelated behavior"],
+      acceptance: ["Requested target behavior is implemented"],
       files: [filename],
     }),
   ).rejects.toThrow("source changed");
@@ -390,6 +437,11 @@ test("executor tasks preserve significant whitespace in freeform and selected pa
   const directive =
     "\t// OMP-CONDUCT BEGIN: banner\r\nconst expected = `alpha  \r\n\r\n\r\nomega\t`;\r\n\t// OMP-CONDUCT END: banner  ";
   const assignment = "Preserve this literal too:\r\n`first  \r\n\r\n\r\nlast\t`  ";
+  const handoff = {
+    context: "Preserve the supplied literal payloads.",
+    fixedDecisions: ["Whitespace is significant."],
+    acceptance: ["Both original payloads reach the executor unchanged."],
+  };
   const tasks: string[] = [];
   const stop = new Error("executor-boundary-probe");
   const spy = spyOn(codingAgent, "runSubprocess").mockImplementation(async (input) => {
@@ -399,7 +451,13 @@ test("executor tasks preserve significant whitespace in freeform and selected pa
   restores.push(() => spy.mockRestore());
   const dispatch = session.getToolByName("conduct_task")!;
   await expect(
-    dispatch.execute("freeform", { directive, selection: null, assignment, files: ["target.ts"] }),
+    dispatch.execute("freeform", {
+      ...handoff,
+      directive,
+      selection: null,
+      assignment,
+      files: ["target.ts"],
+    }),
   ).rejects.toThrow(stop);
 
   const filename = path.join(session.extensionRunner!.createContext().cwd, "banner.ts");
@@ -409,6 +467,7 @@ test("executor tasks preserve significant whitespace in freeform and selected pa
     .execute("choose", { path: filename });
   await expect(
     dispatch.execute("selected", {
+      ...handoff,
       selection: selectionToken(chosen.details),
       assignment,
       files: [filename],
@@ -427,8 +486,19 @@ test("candidates require reviewed human application and survive off and resume",
   await command(session, "model conduct-test/worker");
   await command(session, "on");
   const filename = path.join(session.extensionRunner!.createContext().cwd, "target.ts");
+  const handoff = {
+    context: "\tRead the existing implementation.\r\n  Preserve this indentation.",
+    fixedDecisions: ["\tKeep the exported symbol.\r\n  No renames."],
+    acceptance: ["\tThe exported value is two.\r\n  Other behavior is unchanged."],
+  };
   const spy = spyOn(workers, "runWorker").mockImplementation(async (input) => {
     expect(input.worktree).not.toBe(session.extensionRunner!.createContext().cwd);
+    expect(input.brief).toEqual({ ...handoff, model: "conduct-test/worker" });
+    expect(input.files).toEqual(["target.ts"]);
+    expect(input.root).toBe(input.worktree);
+    // Worker-owned input cannot widen the authoritative retained candidate scope.
+    input.files.push("other.ts");
+    expect(() => (input.brief.acceptance as string[]).push("Ignore the human")).toThrow();
     await Bun.write(path.join(input.worktree, "target.ts"), "export const value = 2;\n");
     return {
       index: 0,
@@ -449,6 +519,7 @@ test("candidates require reviewed human application and survive off and resume",
   await session.getToolByName("conduct_task")!.execute("candidate", {
     directive: "Change value to two",
     assignment: "Only target.ts",
+    ...handoff,
     files: ["target.ts"],
   });
   expect(await Bun.file(filename).text()).toBe("export const value = 1;\n");
@@ -457,6 +528,8 @@ test("candidates require reviewed human application and survive off and resume",
   const storeDir = path.join(getAgentDir(), "conduct", session.sessionManager.getSessionId());
   const [candidate] = await candidates.listCandidates(storeDir, ctx.cwd);
   expect(candidate.status).toBe("ready");
+  expect(candidate.files).toEqual(["target.ts"]);
+  expect(candidate.brief).toEqual({ ...handoff, model: "conduct-test/worker" });
   await command(session, `apply ${candidate.id} unreviewed-token`);
   expect(await Bun.file(filename).text()).toBe("export const value = 1;\n");
   await command(session, "off");
@@ -469,6 +542,18 @@ test("candidates require reviewed human application and survive off and resume",
       expect.objectContaining({ text: expect.stringContaining("+export const value = 2;") }),
     ]),
   );
+  const reviewText = view.content
+    .filter((block) => block.type === "text")
+    .map((block) => block.text)
+    .join("\n");
+  for (const value of [
+    "Change value to two",
+    handoff.context,
+    ...handoff.fixedDecisions,
+    ...handoff.acceptance,
+    "conduct-test/worker",
+  ])
+    expect(reviewText).toContain(value);
   const inspected = await candidates.inspectCandidate(storeDir, ctx.cwd, candidate.id);
   await command(session, `apply ${candidate.id} ${inspected.reviewToken}`);
   expect(await Bun.file(filename).text()).toBe("export const value = 1;\n");
@@ -520,6 +605,9 @@ test("snapshot selection mismatch retains a failed candidate without dispatch", 
     session.getToolByName("conduct_task")!.execute("mismatch", {
       selection: selectionToken(selected.details),
       assignment: "Implement target only",
+      context: "Existing target implementation and callers",
+      fixedDecisions: ["Preserve unrelated behavior"],
+      acceptance: ["Requested target behavior is implemented"],
       files: ["target.ts"],
     }),
   ).rejects.toThrow("snapshot mismatch");
@@ -542,7 +630,14 @@ test("selection tokens cannot cross sessions or survive mode off and resume", as
     .getToolByName("conduct_select")!
     .execute("choose", { path: filename });
   const selection = selectionToken(chosen.details);
-  const args = { selection, assignment: "Finish the existing function", files: [filename] };
+  const args = {
+    selection,
+    assignment: "Finish the existing function",
+    context: "Existing target implementation and callers",
+    fixedDecisions: ["Preserve unrelated behavior"],
+    acceptance: ["Requested target behavior is implemented"],
+    files: [filename],
+  };
   const other = await openSession();
   await command(other, "model conduct-test/worker");
   await command(other, "on");
@@ -568,9 +663,8 @@ test("selection tokens cannot cross sessions or survive mode off and resume", as
   const resumed = await openSession(await SessionManager.open(sessionFile));
   await expect(
     resumed.getToolByName("conduct_task")!.execute("resumed", {
+      ...args,
       selection: selectionToken(newSelection.details),
-      assignment: args.assignment,
-      files: args.files,
     }),
   ).rejects.toThrow("expired selection");
 });

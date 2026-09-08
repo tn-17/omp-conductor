@@ -21,6 +21,12 @@ export type CandidateStatus =
   | "applying"
   | "applied";
 type FileState = { kind: "absent" } | { kind: "file"; hash: string; mode: number };
+export interface CandidateBrief {
+  readonly context: string;
+  readonly fixedDecisions: readonly string[];
+  readonly acceptance: readonly string[];
+  readonly model: string;
+}
 export interface CandidateRecord {
   version: 1;
   id: string;
@@ -31,6 +37,7 @@ export interface CandidateRecord {
   createdAt: string;
   directive: string;
   assignment: string;
+  brief?: CandidateBrief;
   changes: string[];
   patchPath: string;
   reviewToken?: string;
@@ -364,7 +371,29 @@ export async function prepareCandidate(input: {
   files: string[];
   directive: string;
   assignment: string;
+  brief: CandidateBrief;
 }): Promise<PreparedCandidate> {
+  const meaningful = (value: unknown): value is string =>
+    typeof value === "string" && value.trim().length > 0;
+  if (
+    !input.brief ||
+    !meaningful(input.brief.context) ||
+    !meaningful(input.brief.model) ||
+    !Array.isArray(input.brief.fixedDecisions) ||
+    !input.brief.fixedDecisions.every(meaningful) ||
+    !Array.isArray(input.brief.acceptance) ||
+    !input.brief.acceptance.length ||
+    !input.brief.acceptance.every(meaningful)
+  )
+    throw new Error(
+      "Candidate requires meaningful context, fixedDecisions, acceptance, and model.",
+    );
+  const brief: CandidateBrief = Object.freeze({
+    context: input.brief.context,
+    fixedDecisions: Object.freeze([...input.brief.fixedDecisions]),
+    acceptance: Object.freeze([...input.brief.acceptance]),
+    model: input.brief.model,
+  });
   const cwd = await fs.realpath(input.cwd);
   const root = await rootFor(cwd);
   const storeDir = path.resolve(input.storeDir);
@@ -440,6 +469,7 @@ export async function prepareCandidate(input: {
       createdAt: new Date().toISOString(),
       directive: input.directive,
       assignment: input.assignment,
+      brief,
       changes: [],
       patchPath: path.join(directory, "candidate.patch"),
       baseline,

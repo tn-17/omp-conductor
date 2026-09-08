@@ -4,15 +4,37 @@ Patch artifact: {{patchPath}}
 
 # Original directive
 
-{{#each directiveLines}}
-    {{{this}}}
-{{/each}}
+{{{directive}}}
 
 # Frontier assignment
 
-{{#each assignmentLines}}
-    {{{this}}}
+{{{assignment}}}
+
+# Structured handoff
+
+{{#if brief}}
+Chosen worker model: {{{brief.model}}}
+
+## Read-only context
+
+{{{brief.context}}}
+
+## Fixed decisions
+
+{{#each brief.fixedDecisions}}
+{{{this}}}
+{{else}}
+None specified.
 {{/each}}
+
+## Acceptance criteria
+
+{{#each brief.acceptance}}
+{{{this}}}
+{{/each}}
+{{else}}
+This retained candidate predates structured handoffs; no brief was recorded.
+{{/if}}
 
 # Actual candidate patch
 

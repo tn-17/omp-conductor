@@ -68,6 +68,12 @@ async function prepare(
     files,
     directive: "implement",
     assignment: "change exact scope",
+    brief: {
+      context: "Existing saved source",
+      fixedDecisions: ["Preserve other.txt"],
+      acceptance: ["Requested change is present"],
+      model: "conduct-test/worker",
+    },
   });
   snapshots.push(prepared);
   return prepared;
@@ -212,7 +218,7 @@ test("ignored scope is explicit while unrelated ignored content is not retained 
   expect(await fs.stat(path.join(storeDir, record.id, "git")).catch(() => null)).toBeNull();
 });
 
-test("retained patch tampering and scope tampering invalidate prior approval", async () => {
+test("retained patch and structured brief tampering invalidate prior approval", async () => {
   const { root, storeDir } = await workspace();
   const first = await ready(root, storeDir);
   const review = await inspectCandidate(storeDir, root, first.id);
@@ -223,7 +229,7 @@ test("retained patch tampering and scope tampering invalidate prior approval", a
   const second = await ready(root, storeDir);
   const filename = path.join(storeDir, second.id, "record.json");
   const record = JSON.parse(await fs.readFile(filename, "utf8"));
-  record.assignment = "different candidate identity";
+  record.brief.acceptance = ["Approve unrelated behavior"];
   await fs.writeFile(filename, JSON.stringify(record));
   await expect(applyCandidate(storeDir, root, second.id, second.reviewToken)).rejects.toThrow(
     "Review token",
