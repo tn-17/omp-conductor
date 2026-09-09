@@ -119,9 +119,16 @@ async function openSession(manager?: SessionManager, settings?: Settings): Promi
 
 async function command(session: AgentSession, args: string): Promise<void> {
   const runner = session.extensionRunner!;
-  const registered = runner.getCommand("conduct")!;
+  const registered = runner.getCommand("conductor")!;
   await registered.handler(args, runner.createCommandContext());
 }
+
+test("registers /conductor without the former /conduct alias", async () => {
+  const session = await openSession();
+  const runner = session.extensionRunner!;
+  expect(runner.getCommand("conductor")).toBeDefined();
+  expect(runner.getCommand("conduct")).toBeUndefined();
+});
 
 test("verification configuration preserves exact quoted argv and rejects malformed input", async () => {
   const session = await openSession();
@@ -702,7 +709,7 @@ test.each(["cancel", "off cancel"])(
       const notifications: { type: unknown }[] = [];
       let commandFinished = false;
       cancellation = Promise.resolve(
-        runner.getCommand("conduct")!.handler(action, {
+        runner.getCommand("conductor")!.handler(action, {
           ...ctx,
           ui: {
             ...ctx.ui,

@@ -2,7 +2,7 @@
 
 A human-directed implementation workflow for [Oh My Pi (OMP)](https://github.com/can1357/oh-my-pi): plan with a frontier model, leave directives or pseudocode in your code, and delegate bounded implementation to local models.
 
-Conductor adds `/conduct` mode without modifying OMP itself. Implementers work in independent snapshots and return **unapplied candidates**. Optional verification and scoped adversarial review can drive corrections before the frontier reviews the final patch and you explicitly apply it.
+Conductor adds `/conductor` mode without modifying OMP itself. Implementers work in independent snapshots and return **unapplied candidates**. Optional verification and scoped adversarial review can drive corrections before the frontier reviews the final patch and you explicitly apply it.
 
 **This is workflow protection, not an operating-system sandbox.** In particular, optional trusted verification executes project code with host permissions.
 
@@ -14,7 +14,7 @@ Conductor adds `/conduct` mode without modifying OMP itself. Implementers work i
 4. Local implementers work in copied snapshots. Independent assignments can run concurrently.
 5. If configured, Conduct runs verification and a scoped reviewer, then gives findings back to a fresh implementer for correction.
 6. The frontier inspects the actual candidate patch and retained evidence.
-7. You apply an acceptable candidate with its exact `/conduct apply` command, then verify the applied behavior.
+7. You apply an acceptable candidate with its exact `/conductor apply` command, then verify the applied behavior.
 
 Conductor does not automatically discover work, implement every TODO, widen file ownership, or apply model-generated patches. A model's completion report is not acceptance.
 
@@ -50,13 +50,13 @@ omp -e /absolute/path/to/omp-conductor
 This loads Conductor for that invocation; it does not permanently install it. Keep your preferred frontier model as the main model, and select a separately configured local implementer:
 
 ```text
-/conduct model <local-provider/model-id>
-/conduct on
+/conductor model <local-provider/model-id>
+/conductor on
 ```
 
 Replace angle-bracket placeholders with actual values. Conductor does not start an inference server or configure a model endpoint for you.
 
-Type `/conduct ` and press **Tab** for option previews, descriptions, and argument usage. Typing a prefix filters the options. Completion inserts text; it does not execute commands or supply candidate IDs or review tokens.
+Type `/conductor ` and press **Tab** for option previews, descriptions, and argument usage. Typing a prefix filters the options. Completion inserts text; it does not execute commands or supply candidate IDs or review tokens.
 
 ## First assignment
 
@@ -79,8 +79,8 @@ Save this in a file such as `src/tags.ts`, then ask the frontier:
 You can also inspect markers yourself:
 
 ```text
-/conduct markers "src/tags.ts"
-/conduct select "src/tags.ts" normalize-tags
+/conductor markers "src/tags.ts"
+/conductor select "src/tags.ts" normalize-tags
 ```
 
 **Selection is only a preview, not authorization to implement.** Markers delimit the directive, not the writable code region. The assignment's exact file list controls which files the implementer may edit; a marker source is not implicitly writable.
@@ -88,7 +88,7 @@ You can also inspect markers yourself:
 When the frontier has reviewed the actual candidate, use the exact command it returns:
 
 ```text
-/conduct apply <candidate-id> <review-token>
+/conductor apply <candidate-id> <review-token>
 ```
 
 Do not reuse an old token after the candidate artifacts change. Keep target files idle during application; it is not an atomic transaction against concurrent editors. Changed target bytes, file modes, or symlink resolution can make a candidate stale. Unrelated source edits do not automatically invalidate it.
@@ -98,9 +98,9 @@ Do not reuse an old token after the candidate artifacts change. Keep target file
 Select the reviewer independently of the implementer and the main session's advisor:
 
 ```text
-/conduct reviewer <provider/model-id>
-/conduct review-passes 3
-/conduct fast reviewer on
+/conductor reviewer <provider/model-id>
+/conductor review-passes 3
+/conductor fast reviewer on
 ```
 
 The reviewer is read-only. It receives the original directive and assignment, fixed decisions, acceptance criteria, cumulative patch against the original snapshot, previous findings, the latest implementer report, and available verification results. It may read surrounding snapshot context, but findings must concern the authorized writable files.
@@ -127,9 +127,9 @@ A clean automated review is neither proof of correctness nor permission to apply
 Only a human-configured command is used; implementers and reviewers do not receive shell tools.
 
 ```text
-/conduct verify bun test
-/conduct verify
-/conduct verify off
+/conductor verify bun test
+/conductor verify
+/conductor verify off
 ```
 
 `bun test` is an example, not an automatically selected command. Configure a finite command appropriate for your project and available dependencies. Configuration alone executes nothing.
@@ -157,8 +157,8 @@ With verification enabled but the reviewer disabled, Conduct runs one verificati
 The advisor supplies guidance while an implementer works; the reviewer inspects completed work afterward. They are separate, optional mechanisms:
 
 ```text
-/conduct advisor <provider/model-id>
-/conduct advisor off
+/conductor advisor <provider/model-id>
+/conductor advisor off
 ```
 
 The worker advisor defaults off and is independent of the main session's `ADVISOR` role. It receives guarded snapshot reads and an advice channel, not editing, execution, delegation, or application authority. Advice is asynchronous and may arrive too late for a short implementation. Advisor startup and runtime errors fail the candidate rather than silently continuing without the selected advisor.
@@ -168,10 +168,10 @@ Choosing a cloud advisor or reviewer discloses the relevant assignment, snapshot
 ## Independent fast preferences
 
 ```text
-/conduct fast worker on
-/conduct fast advisor on
-/conduct fast reviewer on
-/conduct fast
+/conductor fast worker on
+/conductor fast advisor on
+/conductor fast reviewer on
+/conductor fast
 ```
 
 All three default **off**. Replace `on` with `off` to disable a preference, or omit the value to report it. Enabling advisor/reviewer fast mode does not enable that role.
@@ -181,7 +181,7 @@ Fast mode requests the provider's priority processing tier; it is not a reasonin
 ## Concurrent assignments
 
 ```text
-/conduct workers 2
+/conductor workers 2
 ```
 
 The worker limit defaults to **1**, with a maximum of **8**. Ask the frontier to use one `conduct_batch` for independent assignments with settled interfaces and disjoint exact writable files.
@@ -201,24 +201,24 @@ Square brackets below indicate optional arguments; do not type the brackets.
 
 | Command | Purpose |
 | --- | --- |
-| `/conduct on` | Enable Conduct mode. |
-| `/conduct off` | Disable when idle. |
-| `/conduct off cancel` | Cancel unfinished work, retain candidates, and disable. |
-| `/conduct status` | Show configuration and activity. |
-| `/conduct model [provider/id]` | Select the local implementer model; omit the selector to open the interactive picker. |
-| `/conduct workers [1..8]` | Report or set the batch limit. |
-| `/conduct advisor [off\|provider/model-id]` | Report, select, or disable the worker advisor. |
-| `/conduct reviewer [off\|provider/model-id]` | Report, select, or disable the post-implementation reviewer. |
-| `/conduct review-passes [1..10]` | Report or set the total review limit. |
-| `/conduct verify [off\|command args...]` | Report, disable, or configure trusted verification. |
-| `/conduct fast [worker\|advisor\|reviewer [on\|off]]` | Report or set independent priority preferences. |
-| `/conduct cancel` | Cancel unfinished stages and wait for capture. |
-| `/conduct markers "file"` | List directives in a supported source file. |
-| `/conduct select "file" [name\|@line]` | Preview a selected directive. |
-| `/conduct candidates` | List retained candidates. |
-| `/conduct review id` | Inspect the patch and retained evidence; obtain an apply token if ready. |
-| `/conduct apply id reviewToken` | Explicitly apply the reviewed, ready candidate. |
-| `/conduct reject id` | Reject a candidate. |
+| `/conductor on` | Enable Conduct mode. |
+| `/conductor off` | Disable when idle. |
+| `/conductor off cancel` | Cancel unfinished work, retain candidates, and disable. |
+| `/conductor status` | Show configuration and activity. |
+| `/conductor model [provider/id]` | Select the local implementer model; omit the selector to open the interactive picker. |
+| `/conductor workers [1..8]` | Report or set the batch limit. |
+| `/conductor advisor [off\|provider/model-id]` | Report, select, or disable the worker advisor. |
+| `/conductor reviewer [off\|provider/model-id]` | Report, select, or disable the post-implementation reviewer. |
+| `/conductor review-passes [1..10]` | Report or set the total review limit. |
+| `/conductor verify [off\|command args...]` | Report, disable, or configure trusted verification. |
+| `/conductor fast [worker\|advisor\|reviewer [on\|off]]` | Report or set independent priority preferences. |
+| `/conductor cancel` | Cancel unfinished stages and wait for capture. |
+| `/conductor markers "file"` | List directives in a supported source file. |
+| `/conductor select "file" [name\|@line]` | Preview a selected directive. |
+| `/conductor candidates` | List retained candidates. |
+| `/conductor review id` | Inspect the patch and retained evidence; obtain an apply token if ready. |
+| `/conductor apply id reviewToken` | Explicitly apply the reviewed, ready candidate. |
+| `/conductor reject id` | Reject a retained candidate. |
 
 Selections are session-local and cleared by dispatch, off, reload, or session navigation. Multiple selections can coexist before a batch; stale selections must be refreshed. Configuration persists across Conduct off and session resume, and relevant settings are pinned with each assignment.
 

@@ -33,7 +33,7 @@ const BATCH_TOOL = "conduct_batch";
 const SELECT_TOOL = "conduct_select";
 const CANDIDATE_TOOL = "conduct_candidate";
 const USAGE =
-  '/conduct on | off [cancel] | status | workers [1..8] | model [provider/id] | advisor [off|provider/model-id] | reviewer [off|provider/model-id] | review-passes [1..10] | verify [off|command args...] | fast [worker|advisor|reviewer [on|off]] | cancel | markers "file" | select "file" [name|@line] | candidates | review id | apply id reviewToken | reject id';
+  '/conductor on | off [cancel] | status | workers [1..8] | model [provider/id] | advisor [off|provider/model-id] | reviewer [off|provider/model-id] | review-passes [1..10] | verify [off|command args...] | fast [worker|advisor|reviewer [on|off]] | cancel | markers "file" | select "file" [name|@line] | candidates | review id | apply id reviewToken | reject id';
 
 interface ConductState {
   version: 1;
@@ -280,11 +280,11 @@ export default function conductExtension(pi: ExtensionAPI): void {
       });
       if (!choices.length)
         throw new Error(
-          "No configured loopback model is available. Configure a local model in OMP, then use /conduct model provider/id.",
+          "No configured loopback model is available. Configure a local model in OMP, then use /conductor model provider/id.",
         );
       if (!ctx.hasUI)
         throw new Error(
-          `Choose an exact model with /conduct model provider/id. Available: ${choices.join(", ")}`,
+          `Choose an exact model with /conductor model provider/id. Available: ${choices.join(", ")}`,
         );
       const epoch = sessionEpoch;
       selected = await ctx.ui.select("Conduct local worker", choices);
@@ -352,7 +352,7 @@ export default function conductExtension(pi: ExtensionAPI): void {
     },
     { name: "reject", description: "Reject a retained candidate", hint: "id" },
   ];
-  pi.registerCommand("conduct", {
+  pi.registerCommand("conductor", {
     description: "Prepare protected local-worker candidates; review and explicitly apply them",
     getArgumentCompletions: (argumentPrefix) => {
       if (/\s/.test(argumentPrefix)) return null;
@@ -384,7 +384,7 @@ export default function conductExtension(pi: ExtensionAPI): void {
             if (rest.length !== count) throw new Error(USAGE);
             if (running) throw new Error("Finish or cancel the worker before managing candidates.");
             if (action === "apply" && !state.enabled)
-              throw new Error("Conduct is off. Enable /conduct on before applying.");
+              throw new Error("Conduct is off. Enable /conductor on before applying.");
             if (action === "candidates") {
               const candidates = await listCandidates(store(ctx), ctx.cwd);
               assertEpoch(epoch);
@@ -409,7 +409,7 @@ export default function conductExtension(pi: ExtensionAPI): void {
                       : undefined,
                     patchLines: view.patch.split(/\r?\n/),
                     approval: view.reviewToken
-                      ? `/conduct apply ${view.candidate.id} ${view.reviewToken}`
+                      ? `/conductor apply ${view.candidate.id} ${view.reviewToken}`
                       : "Not applicable.",
                   }),
                   display: true,
@@ -495,7 +495,7 @@ export default function conductExtension(pi: ExtensionAPI): void {
           }
           case "workers": {
             if (rest.length > 1 || (rest.length === 1 && !/^[1-8]$/.test(rest[0])))
-              throw new Error("Use /conduct workers [1..8]; specify an explicit integer.");
+              throw new Error("Use /conductor workers [1..8]; specify an explicit integer.");
             if (rest.length) {
               if (running)
                 throw new Error("Finish or cancel the invocation before changing workers.");
@@ -519,7 +519,7 @@ export default function conductExtension(pi: ExtensionAPI): void {
                 target !== "reviewer") ||
               (value !== undefined && value !== "on" && value !== "off")
             )
-              throw new Error("Use /conduct fast [worker|advisor|reviewer [on|off]].");
+              throw new Error("Use /conductor fast [worker|advisor|reviewer [on|off]].");
             if (value !== undefined) {
               if (running)
                 throw new Error("Cancel or finish the worker before changing fast preferences.");
@@ -546,7 +546,7 @@ export default function conductExtension(pi: ExtensionAPI): void {
           }
           case "review-passes":
             if (rest.length > 1 || (rest.length === 1 && !/^(?:[1-9]|10)$/.test(rest[0])))
-              throw new Error("Use /conduct review-passes [1..10]; specify total reviews.");
+              throw new Error("Use /conductor review-passes [1..10]; specify total reviews.");
             if (rest.length) {
               if (running)
                 throw new Error("Finish or cancel the invocation before changing review passes.");
@@ -639,7 +639,7 @@ export default function conductExtension(pi: ExtensionAPI): void {
               throw new Error(USAGE);
             if (running && rest[0] !== "cancel") {
               ctx.ui.notify(
-                "Invocation still running. Use /conduct off cancel to cancel unfinished work and preserve candidates, or let it finish first. Conduct does not apply patches automatically; trusted verification can affect host/source files.",
+                "Invocation still running. Use /conductor off cancel to cancel unfinished work and preserve candidates, or let it finish first. Conduct does not apply patches automatically; trusted verification can affect host/source files.",
                 "warning",
               );
               return;
@@ -738,7 +738,7 @@ export default function conductExtension(pi: ExtensionAPI): void {
     }),
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       if (!state.enabled)
-        throw new Error("Conduct is off. Enable /conduct on before using conduct_select.");
+        throw new Error("Conduct is off. Enable /conductor on before using conduct_select.");
       if (running || operation)
         throw new Error(
           "Finish the Conduct operation or cancel the worker before selecting another directive.",
@@ -840,7 +840,7 @@ export default function conductExtension(pi: ExtensionAPI): void {
                     : undefined,
                   patchLines: view.patch.split(/\r?\n/),
                   approval: view.reviewToken
-                    ? `/conduct apply ${view.candidate.id} ${view.reviewToken}`
+                    ? `/conductor apply ${view.candidate.id} ${view.reviewToken}`
                     : "Not applicable.",
                 }),
               },
@@ -876,7 +876,7 @@ export default function conductExtension(pi: ExtensionAPI): void {
     selection: pi.typebox.Type.Optional(
       pi.typebox.Type.Union([pi.typebox.Type.String({ minLength: 1 }), pi.typebox.Type.Null()], {
         description:
-          "Token from conduct_select or /conduct select; null or omitted when using directive",
+          "Token from conduct_select or /conductor select; null or omitted when using directive",
       }),
     ),
     files: pi.typebox.Type.Array(pi.typebox.Type.String({ minLength: 1 }), {
@@ -917,7 +917,7 @@ export default function conductExtension(pi: ExtensionAPI): void {
     ctx: ExtensionContext,
   ): Promise<AssignmentResult[]> {
     if (!state.enabled)
-      throw new Error("Conduct is off. The user must enable /conduct on before dispatch.");
+      throw new Error("Conduct is off. The user must enable /conductor on before dispatch.");
     if (running)
       throw new Error(
         "A conduct invocation is already running. Wait for it to finish before dispatching another.",
@@ -927,9 +927,9 @@ export default function conductExtension(pi: ExtensionAPI): void {
       throw new Error("Provide between 1 and 8 tasks.");
     if (tasks.length > state.workers)
       throw new Error(
-        `Batch has ${tasks.length} tasks but the configured worker limit is ${state.workers}. The human must set /conduct workers before dispatch.`,
+        `Batch has ${tasks.length} tasks but the configured worker limit is ${state.workers}. The human must set /conductor workers before dispatch.`,
       );
-    if (!state.model) throw new Error("Select a worker with /conduct model provider/id.");
+    if (!state.model) throw new Error("Select a worker with /conductor model provider/id.");
     const assignments = tasks.map((task): ConductAssignment => {
       if ((task.directive == null) === (task.selection == null))
         throw new Error("Provide exactly one of directive or selection.");
@@ -1036,7 +1036,7 @@ export default function conductExtension(pi: ExtensionAPI): void {
   pi.registerTool({
     name: BATCH_TOOL,
     label: "Conduct worker batch",
-    description: `Run independent Conduct assignments concurrently, returning ordered per-task candidates after all workers and capture finish. Supply tasks using the conduct_task handoff schema. Exact writable ownership must be disjoint, including ancestor paths. The human-configured /conduct workers limit defaults to 1 and cannot exceed 8. No queue, dependencies, automatic apply, or background work. One failed task does not cancel siblings; /conduct cancel cancels all unfinished workers. Review and apply each candidate separately.\n\n${taskDescription}`,
+    description: `Run independent Conduct assignments concurrently, returning ordered per-task candidates after all workers and capture finish. Supply tasks using the conduct_task handoff schema. Exact writable ownership must be disjoint, including ancestor paths. The human-configured /conductor workers limit defaults to 1 and cannot exceed 8. No queue, dependencies, automatic apply, or background work. One failed task does not cancel siblings; /conductor cancel cancels all unfinished workers. Review and apply each candidate separately.\n\n${taskDescription}`,
     defaultInactive: true,
     loadMode: "essential",
     approval: "write",

@@ -419,7 +419,7 @@ export async function runAssignments(input: {
               result?.output,
               candidate.error,
               result?.stderr,
-              "Nothing was applied. Inspect the candidate's actual patch with conduct_candidate, review behavior, then ask the human to run the exact /conduct apply command with its returned review token. Worker reports are not verification.",
+              "Nothing was applied. Inspect the candidate's actual patch with conduct_candidate, review behavior, then ask the human to run the exact /conductor apply command with its returned review token. Worker reports are not verification.",
             ]
               .filter(Boolean)
               .join("\n\n"),
