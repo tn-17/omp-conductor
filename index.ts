@@ -18,6 +18,9 @@ import selectDescription from "./prompts/select.md" with { type: "text" };
 import selectionTemplate from "./prompts/selection.md" with { type: "text" };
 import { readMarkerFile, selectMarker, type MarkerSelection } from "./selection";
 import { resolveAdvisorModel, resolveLocalModel } from "./worker";
+import { resolveReviewerModel } from "./reviewer";
+import { parseVerificationArgs, validateVerification } from "./verification";
+import type { VerificationConfig } from "./review-types";
 import { runAssignments, type ConductAssignment, type AssignmentResult } from "./batch";
 
 // Preserve interpolated source and assignment whitespace without post-render formatting.
@@ -30,7 +33,7 @@ const BATCH_TOOL = "conduct_batch";
 const SELECT_TOOL = "conduct_select";
 const CANDIDATE_TOOL = "conduct_candidate";
 const USAGE =
-  '/conduct on | off [cancel] | status | workers [1..8] | model [provider/id] | advisor [off|provider/model-id] | fast [worker|advisor [on|off]] | cancel | markers "file" | select "file" [name|@line] | candidates | review id | apply id reviewToken | reject id';
+  '/conduct on | off [cancel] | status | workers [1..8] | model [provider/id] | advisor [off|provider/model-id] | reviewer [off|provider/model-id] | review-passes [1..10] | verify [off|command args...] | fast [worker|advisor|reviewer [on|off]] | cancel | markers "file" | select "file" [name|@line] | candidates | review id | apply id reviewToken | reject id';
 
 interface ConductState {
   version: 1;
@@ -40,10 +43,15 @@ interface ConductState {
   advisorModel?: string;
   workerFast?: boolean;
   advisorFast?: boolean;
+  reviewerModel?: string;
+  reviewerFast?: boolean;
+  reviewPasses?: number;
+  verification?: VerificationConfig;
 }
 
 interface ActiveRun {
   phase: "worker" | "capture";
+  stages?: Map<number, string>;
   controller: AbortController;
   done: Promise<void>;
   finish: () => void;
@@ -78,9 +86,58 @@ function parseState(data: unknown): ConductState | undefined {
       data.workers > 8)
   )
     return;
+  if (
+    "reviewerModel" in data &&
+    data.reviewerModel !== undefined &&
+    (typeof data.reviewerModel !== "string" || !/^[^/\s]+\/\S+$/.test(data.reviewerModel))
+  )
+    return;
+  if (
+    "reviewerFast" in data &&
+    data.reviewerFast !== undefined &&
+    typeof data.reviewerFast !== "boolean"
+  )
+    return;
+  if (
+    "reviewPasses" in data &&
+    data.reviewPasses !== undefined &&
+    (typeof data.reviewPasses !== "number" ||
+      !Number.isInteger(data.reviewPasses) ||
+      data.reviewPasses < 1 ||
+      data.reviewPasses > 10)
+  )
+    return;
+  let verification: VerificationConfig | undefined;
+  if ("verification" in data && data.verification !== undefined) {
+    const value = data.verification;
+    if (
+      !value ||
+      typeof value !== "object" ||
+      !("argv" in value) ||
+      !Array.isArray(value.argv) ||
+      !value.argv.every((arg: unknown) => typeof arg === "string") ||
+      !("timeoutMs" in value) ||
+      value.timeoutMs !== 120000
+    )
+      return;
+    verification = { argv: [...value.argv], timeoutMs: 120000 };
+    try {
+      validateVerification(verification);
+    } catch {
+      return;
+    }
+  }
   return {
     version: 1,
     enabled: data.enabled,
+    reviewerModel:
+      "reviewerModel" in data && typeof data.reviewerModel === "string"
+        ? data.reviewerModel
+        : undefined,
+    reviewerFast: "reviewerFast" in data && data.reviewerFast === true,
+    reviewPasses:
+      "reviewPasses" in data && typeof data.reviewPasses === "number" ? data.reviewPasses : 3,
+    verification,
     workers: "workers" in data && typeof data.workers === "number" ? data.workers : 1,
     workerFast: "workerFast" in data && data.workerFast === true,
     advisorFast: "advisorFast" in data && data.advisorFast === true,
@@ -99,6 +156,8 @@ export default function conductExtension(pi: ExtensionAPI): void {
     workers: 1,
     workerFast: false,
     advisorFast: false,
+    reviewerFast: false,
+    reviewPasses: 3,
   };
   let hasState = false;
   let running: ActiveRun | undefined;
@@ -130,11 +189,21 @@ export default function conductExtension(pi: ExtensionAPI): void {
     if (epoch !== sessionEpoch) throw new Error("Session changed; retry in the current session.");
   }
 
+  function reviewStatus(): string {
+    return `reviewer ${state.reviewerModel ?? "off"} | reviewer fast ${state.reviewerFast === true ? "on" : "off"} | reviews ${state.reviewPasses ?? 3} | verify ${state.verification ? `${JSON.stringify(state.verification.argv)} (120000ms, trusted host)` : "off"}`;
+  }
+
+  function stageStatus(): string {
+    return running?.stages?.size
+      ? [...running.stages].map(([index, stage]) => `task ${index + 1}: ${stage}`).join("; ")
+      : "invocation running";
+  }
+
   function updateStatus(ctx: ExtensionContext): void {
     ctx.ui.setStatus(
       "conduct",
       state.enabled
-        ? `Conduct: on | workers ${state.workers} | advisor ${state.advisorModel ?? "off"} | requested fast worker ${state.workerFast === true ? "on" : "off"}, advisor ${state.advisorFast === true ? "on" : "off"}${running ? (running.phase === "worker" ? " | invocation running" : " | capturing candidates") : ""}`
+        ? `Conduct: on | workers ${state.workers} | advisor ${state.advisorModel ?? "off"} | requested fast worker ${state.workerFast === true ? "on" : "off"}, advisor ${state.advisorFast === true ? "on" : "off"} | ${reviewStatus()}${running ? (running.phase === "worker" ? ` | ${stageStatus()}` : " | capturing candidates") : ""}`
         : undefined,
     );
   }
@@ -162,7 +231,15 @@ export default function conductExtension(pi: ExtensionAPI): void {
     selectionEpoch++;
     selected = undefined;
     selections.clear();
-    state = { version: 1, enabled: false, workers: 1, workerFast: false, advisorFast: false };
+    state = {
+      version: 1,
+      enabled: false,
+      workers: 1,
+      workerFast: false,
+      advisorFast: false,
+      reviewerFast: false,
+      reviewPasses: 3,
+    };
     hasState = false;
     for (const entry of ctx.sessionManager.getBranch()) {
       if (entry.type !== "custom" || entry.customType !== STATE_ENTRY) continue;
@@ -238,9 +315,24 @@ export default function conductExtension(pi: ExtensionAPI): void {
     {
       name: "fast",
       description: "Show or set independent priority preferences",
-      hint: "[worker|advisor [on|off]]",
+      hint: "[worker|advisor|reviewer [on|off]]",
     },
-    { name: "cancel", description: "Cancel unfinished workers and await candidate capture" },
+    {
+      name: "reviewer",
+      description: "Show, choose, or disable the read-only reviewer",
+      hint: "[off|provider/model-id]",
+    },
+    {
+      name: "review-passes",
+      description: "Set total reviews; 3 permits at most 2 corrections",
+      hint: "[1..10]",
+    },
+    {
+      name: "verify",
+      description: "Configure trusted-host test argv; no implicit shell or installs",
+      hint: "[off|command args...]",
+    },
+    { name: "cancel", description: "Cancel unfinished work and await candidate capture" },
     { name: "markers", description: "List deferred directives in a file", hint: '"file"' },
     {
       name: "select",
@@ -309,6 +401,12 @@ export default function conductExtension(pi: ExtensionAPI): void {
                   customType: "conduct-candidate",
                   content: renderCandidateView({
                     ...view.candidate,
+                    verificationCommand: view.candidate.brief?.verification
+                      ? JSON.stringify(view.candidate.brief.verification.argv)
+                      : undefined,
+                    reviewLines: view.candidate.review
+                      ? JSON.stringify(view.candidate.review, null, 2).split("\n")
+                      : undefined,
                     patchLines: view.patch.split(/\r?\n/),
                     approval: view.reviewToken
                       ? `/conduct apply ${view.candidate.id} ${view.reviewToken}`
@@ -332,7 +430,7 @@ export default function conductExtension(pi: ExtensionAPI): void {
           case "status":
             if (rest.length) throw new Error(USAGE);
             ctx.ui.notify(
-              `Conduct ${state.enabled ? "on" : "off"}. Worker: ${state.model ?? "not selected"}. Worker limit: ${state.workers}. Advisor: ${state.advisorModel ?? "off"}. Requested fast: worker ${state.workerFast === true ? "on" : "off"}; advisor ${state.advisorFast === true ? "on" : "off"}. ${running ? "Invocation running." : "Idle."} ${selected ? `Selected: ${selected.path}:${selected.startLine}-${selected.endLine}.` : "No marker selected."} Protected unapplied candidates; explicit human application; no OS sandbox.`,
+              `Conduct ${state.enabled ? "on" : "off"}. Worker: ${state.model ?? "not selected"}. Worker limit: ${state.workers}. Advisor: ${state.advisorModel ?? "off"}. Requested fast: worker ${state.workerFast === true ? "on" : "off"}; advisor ${state.advisorFast === true ? "on" : "off"}. ${reviewStatus()}. ${running ? `${stageStatus()}.` : "Idle."} ${selected ? `Selected: ${selected.path}:${selected.startLine}-${selected.endLine}.` : "No marker selected."} Protected unapplied candidates; explicit human application; no OS sandbox.`,
               "info",
             );
             return;
@@ -415,30 +513,89 @@ export default function conductExtension(pi: ExtensionAPI): void {
             const [target, value] = rest;
             if (
               rest.length > 2 ||
-              (target !== undefined && target !== "worker" && target !== "advisor") ||
+              (target !== undefined &&
+                target !== "worker" &&
+                target !== "advisor" &&
+                target !== "reviewer") ||
               (value !== undefined && value !== "on" && value !== "off")
             )
-              throw new Error("Use /conduct fast [worker|advisor [on|off]].");
+              throw new Error("Use /conduct fast [worker|advisor|reviewer [on|off]].");
             if (value !== undefined) {
               if (running)
                 throw new Error("Cancel or finish the worker before changing fast preferences.");
               state = {
                 ...state,
-                [target === "worker" ? "workerFast" : "advisorFast"]: value === "on",
+                [target === "worker"
+                  ? "workerFast"
+                  : target === "advisor"
+                    ? "advisorFast"
+                    : "reviewerFast"]: value === "on",
               };
               persist();
               updateStatus(ctx);
             }
             const report =
               target === undefined
-                ? `worker ${state.workerFast === true ? "on" : "off"}; advisor ${state.advisorFast === true ? "on" : "off"}`
-                : `${target} ${state[target === "worker" ? "workerFast" : "advisorFast"] === true ? "on" : "off"}`;
+                ? `worker ${state.workerFast === true ? "on" : "off"}; advisor ${state.advisorFast === true ? "on" : "off"}; reviewer ${state.reviewerFast === true ? "on" : "off"}`
+                : `${target} ${state[target === "worker" ? "workerFast" : target === "advisor" ? "advisorFast" : "reviewerFast"] === true ? "on" : "off"}`;
             ctx.ui.notify(
-              `Conduct requested fast: ${report}. On requests priority and may cost more; unsupported/local providers may ignore or reject it. Advisor fast is a preference, not advisor enablement.`,
+              `Conduct requested fast: ${report}. On requests priority and may cost more; unsupported/local providers may ignore or reject it. Advisor and reviewer fast preferences do not enable those roles.`,
               "info",
             );
             return;
           }
+          case "review-passes":
+            if (rest.length > 1 || (rest.length === 1 && !/^(?:[1-9]|10)$/.test(rest[0])))
+              throw new Error("Use /conduct review-passes [1..10]; specify total reviews.");
+            if (rest.length) {
+              if (running)
+                throw new Error("Finish or cancel the invocation before changing review passes.");
+              state = { ...state, reviewPasses: Number(rest[0]) };
+              persist();
+              updateStatus(ctx);
+            }
+            ctx.ui.notify(
+              `Conduct total reviews: ${state.reviewPasses ?? 3}; at most ${(state.reviewPasses ?? 3) - 1} corrections. Remaining findings or failed verification at the cap require attention, never automatic approval.`,
+              "info",
+            );
+            return;
+          case "verify": {
+            const [verb, ...argv] = parseVerificationArgs(args);
+            if (verb !== "verify") throw new Error(USAGE);
+            if (argv.length) {
+              if (running)
+                throw new Error("Finish or cancel the invocation before changing verification.");
+              if (argv[0] === "off" && argv.length !== 1) throw new Error(USAGE);
+              const verification = argv[0] === "off" ? undefined : { argv, timeoutMs: 120000 };
+              if (verification) validateVerification(verification);
+              state = { ...state, verification };
+              persist();
+              updateStatus(ctx);
+            }
+            ctx.ui.notify(
+              `Conduct verification: ${state.verification ? `${JSON.stringify(state.verification.argv)}; timeout 120000ms. TRUSTED HOST: project code has inherited host permissions and environment; it can read secrets, modify host/source files, access the network, and launch processes. The disposable copy is NOT a sandbox. Arguments and bounded output are retained and shared with the configured reviewer and correction worker. No implicit shell, dependency installation, or execution at configuration time. Ignored node_modules are not copied; configure an appropriate command and dependencies.` : "off."}`,
+              state.verification ? "warning" : "info",
+            );
+            return;
+          }
+          case "reviewer":
+            if (rest.length > 1) throw new Error(USAGE);
+            if (rest.length) {
+              if (running)
+                throw new Error("Finish or cancel the invocation before changing its reviewer.");
+              const reviewer = rest[0] === "off" ? undefined : resolveReviewerModel(ctx, rest[0]);
+              state = {
+                ...state,
+                reviewerModel: reviewer ? `${reviewer.provider}/${reviewer.id}` : undefined,
+              };
+              persist();
+              updateStatus(ctx);
+            }
+            ctx.ui.notify(
+              `Conduct reviewer: ${state.reviewerModel ?? "off"}.${state.reviewerModel ? " Opt-in read-only review may disclose snapshot, task, patch, and verification data to the selected provider. Reviews do not widen scope or replace frontier review and explicit human application." : ""}`,
+              state.reviewerModel ? "warning" : "info",
+            );
+            return;
           case "advisor":
             if (rest.length > 1) throw new Error(USAGE);
             if (rest.length) {
@@ -482,7 +639,7 @@ export default function conductExtension(pi: ExtensionAPI): void {
               throw new Error(USAGE);
             if (running && rest[0] !== "cancel") {
               ctx.ui.notify(
-                "Invocation still running. Use /conduct off cancel to cancel all unfinished workers, preserve candidates, and disable the mode, or let it finish first. Source targets remain unchanged.",
+                "Invocation still running. Use /conduct off cancel to cancel unfinished work and preserve candidates, or let it finish first. Conduct does not apply patches automatically; trusted verification can affect host/source files.",
                 "warning",
               );
               return;
@@ -675,6 +832,12 @@ export default function conductExtension(pi: ExtensionAPI): void {
                 type: "text",
                 text: renderCandidateView({
                   ...view.candidate,
+                  verificationCommand: view.candidate.brief?.verification
+                    ? JSON.stringify(view.candidate.brief.verification.argv)
+                    : undefined,
+                  reviewLines: view.candidate.review
+                    ? JSON.stringify(view.candidate.review, null, 2).split("\n")
+                    : undefined,
                   patchLines: view.patch.split(/\r?\n/),
                   approval: view.reviewToken
                     ? `/conduct apply ${view.candidate.id} ${view.reviewToken}`
@@ -776,11 +939,17 @@ export default function conductExtension(pi: ExtensionAPI): void {
       return { ...task, directive: task.directive ?? undefined, selection: chosen };
     });
     const model = resolveLocalModel(ctx, state.model);
-    const { advisorModel, workerFast, advisorFast } = state;
+    const { advisorModel, workerFast, advisorFast, reviewerModel, reviewerFast, reviewPasses } =
+      state;
+    const verification = state.verification
+      ? { argv: [...state.verification.argv], timeoutMs: state.verification.timeoutMs }
+      : undefined;
     if (advisorModel) resolveAdvisorModel(ctx, advisorModel);
+    if (reviewerModel) resolveReviewerModel(ctx, reviewerModel);
+    if (verification) validateVerification(verification);
     const controller = new AbortController();
     const { promise: done, resolve: finish } = Promise.withResolvers<void>();
-    const active: ActiveRun = { phase: "worker", controller, done, finish };
+    const active: ActiveRun = { phase: "worker", stages: new Map(), controller, done, finish };
     running = active;
     selectionEpoch++;
     selections.clear();
@@ -797,6 +966,10 @@ export default function conductExtension(pi: ExtensionAPI): void {
         advisorModel,
         workerFast,
         advisorFast,
+        reviewerModel,
+        reviewerFast,
+        reviewPasses: reviewPasses ?? 3,
+        verification,
         signal: runSignal,
         onPrepared: () => {
           retained = true;
@@ -805,18 +978,31 @@ export default function conductExtension(pi: ExtensionAPI): void {
           active.phase = phase;
           updateStatus(ctx);
         },
-        onProgress: (index, progress) =>
+        onStage: (index, stage) => {
+          active.stages?.set(index, stage);
+          updateStatus(ctx);
+          onUpdate?.({
+            content: [{ type: "text", text: `Task ${index + 1}/${tasks.length}: ${stage}.` }],
+            details: { index, count: tasks.length, stage },
+          });
+        },
+        onProgress: (index, progress, stage = "implementation") =>
           onUpdate?.({
             content: [
               {
                 type: "text",
-                text: `Task ${index + 1}/${tasks.length}: local worker ${progress.status}; advisor ${advisorModel ?? "off"}; requested fast worker ${workerFast === true ? "on" : "off"}, advisor ${advisorFast === true ? "on" : "off"}; ${progress.toolCount} tool calls${progress.currentTool ? `; ${progress.currentTool}` : ""}.`,
+                text: `Task ${index + 1}/${tasks.length}: ${stage} ${progress.status}; advisor ${advisorModel ?? "off"}; reviewer ${reviewerModel ?? "off"}; requested fast worker ${workerFast === true ? "on" : "off"}, advisor ${advisorFast === true ? "on" : "off"}, reviewer ${reviewerFast === true ? "on" : "off"}; ${progress.toolCount} tool calls${progress.currentTool ? `; ${progress.currentTool}` : ""}.`,
               },
             ],
             details: {
               index,
               count: tasks.length,
               status: progress.status,
+              stage,
+              reviewerModel,
+              reviewerFast: reviewerFast === true,
+              reviewPasses: reviewPasses ?? 3,
+              verification,
               model: progress.resolvedModel,
               advisorModel,
               workerFast: workerFast === true,

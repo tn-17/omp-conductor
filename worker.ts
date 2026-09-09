@@ -16,6 +16,7 @@ import assignmentTemplate from "./prompts/assignment.md" with { type: "text" };
 import workerPrompt from "./prompts/worker.md" with { type: "text" };
 import type { CandidateBrief } from "./candidates";
 import { createWorkerTools } from "./worker-tools";
+import { assertNoExecutableCommands } from "./execution-policy";
 
 // Post-render formatting would alter significant whitespace in user payloads.
 const renderAssignment = prompt.compile(assignmentTemplate);
@@ -73,6 +74,9 @@ export async function runWorker(input: {
   const selector = `${input.model.provider}/${input.model.id}`;
   // Revalidate the current registry rather than trusting a previously selected object.
   resolveLocalModel(ctx, selector);
+  signal.throwIfAborted();
+  await assertNoExecutableCommands(input.worktree);
+  signal.throwIfAborted();
   const advisorModel =
     input.brief.advisorModel === undefined
       ? undefined

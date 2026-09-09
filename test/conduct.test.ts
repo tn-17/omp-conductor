@@ -123,6 +123,90 @@ async function command(session: AgentSession, args: string): Promise<void> {
   await registered.handler(args, runner.createCommandContext());
 }
 
+test("verification configuration preserves exact quoted argv and rejects malformed input", async () => {
+  const session = await openSession();
+  await command(session, 'verify executable "" expected');
+  expect(savedState(session)).toMatchObject({
+    verification: { argv: ["executable", "", "expected"], timeoutMs: 120000 },
+  });
+  const configured = savedState(session);
+  await command(session, 'verify executable "unfinished');
+  expect(savedState(session)).toEqual(configured);
+  await command(session, "verify executable trailing\\");
+  expect(savedState(session)).toEqual(configured);
+  await command(session, 'verify ""');
+  expect(savedState(session)).toEqual(configured);
+});
+
+test("review and verification configuration survives resume and stays pinned while active", async () => {
+  let session = await openSession();
+  await command(session, "model conduct-test/worker");
+  await command(session, "reviewer conduct-cloud/worker");
+  await command(session, "fast reviewer on");
+  await command(session, "review-passes 2");
+  await command(session, 'verify executable "" expected');
+  await command(session, "off");
+  const manager = session.sessionManager;
+  await manager.ensureOnDisk();
+  await manager.flush();
+  const sessionFile = manager.getSessionFile()!;
+  await session.dispose();
+  sessions.splice(sessions.indexOf(session), 1);
+  session = await openSession(await SessionManager.open(sessionFile));
+  await command(session, "on");
+  const before = savedState(session);
+  const parentRoles = session.settings.getModelRoles();
+  for (const invalid of [
+    "reviewer worker",
+    "review-passes 0",
+    "review-passes 11",
+    "fast reviewer maybe",
+  ]) {
+    await command(session, invalid);
+    expect(savedState(session)).toEqual(before);
+  }
+  const started = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const spy = spyOn(workers, "runWorker").mockImplementation(async () => {
+    started.resolve();
+    await release.promise;
+    throw new Error("configuration probe complete");
+  });
+  restores.push(() => spy.mockRestore());
+  const execution = session.getToolByName("conduct_task")!.execute("pinned-review", {
+    directive: "Change value to two.",
+    selection: null,
+    files: ["target.ts"],
+    assignment: "Change the export.",
+    context: "The existing export is one.",
+    fixedDecisions: [],
+    acceptance: ["The export is two."],
+  });
+  try {
+    await started.promise;
+    for (const change of ["reviewer off", "fast reviewer off", "review-passes 10", "verify off"]) {
+      await command(session, change);
+      expect(savedState(session)).toEqual(before);
+    }
+    release.resolve();
+    await execution;
+    const retained = await candidates.listCandidates(
+      path.join(getAgentDir(), "conduct", session.sessionManager.getSessionId()),
+      session.extensionRunner!.createContext().cwd,
+    );
+    expect(retained[0]!.brief).toMatchObject({
+      reviewerModel: "conduct-cloud/worker",
+      reviewerFast: true,
+      reviewPasses: 2,
+      verification: { argv: ["executable", "", "expected"], timeoutMs: 120000 },
+    });
+    expect(session.settings.getModelRoles()).toEqual(parentRoles);
+  } finally {
+    release.resolve();
+    await execution.catch(() => {});
+  }
+});
+
 test("mode restores from disk without leaking to another session", async () => {
   const session = await openSession();
   await command(session, "model conduct-test/worker");
@@ -832,7 +916,6 @@ test("candidates require reviewed human application and survive off and resume",
   };
   const spy = spyOn(workers, "runWorker").mockImplementation(async (input) => {
     expect(input.worktree).not.toBe(session.extensionRunner!.createContext().cwd);
-    expect(input.brief).toEqual({ ...handoff, model: "conduct-test/worker" });
     expect(input.files).toEqual(["target.ts"]);
     expect(input.root).toBe(input.worktree);
     // Worker-owned input cannot widen the authoritative retained candidate scope.
@@ -870,10 +953,10 @@ test("candidates require reviewed human application and survive off and resume",
   const [candidate] = await candidates.listCandidates(storeDir, ctx.cwd);
   expect(candidate.status).toBe("ready");
   expect(candidate.files).toEqual(["target.ts"]);
-  expect(candidate.brief).toEqual({ ...handoff, model: "conduct-test/worker" });
+  expect(candidate.brief).toMatchObject({ ...handoff, model: "conduct-test/worker" });
   await command(session, "fast worker off");
   await command(session, "fast advisor on");
-  expect((await candidates.listCandidates(storeDir, ctx.cwd))[0].brief).toEqual({
+  expect((await candidates.listCandidates(storeDir, ctx.cwd))[0].brief).toMatchObject({
     ...handoff,
     model: "conduct-test/worker",
   });
@@ -916,7 +999,7 @@ test("candidates require reviewed human application and survive off and resume",
   const review = await resumed
     .getToolByName("conduct_candidate")!
     .execute("restored-review", { id: candidate.id });
-  expect((await candidates.listCandidates(storeDir, ctx.cwd))[0].brief).toEqual({
+  expect((await candidates.listCandidates(storeDir, ctx.cwd))[0].brief).toMatchObject({
     ...handoff,
     model: "conduct-test/worker",
   });

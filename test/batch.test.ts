@@ -14,6 +14,9 @@ import {
 import { initializeExtensions } from "@oh-my-pi/pi-coding-agent/modes/runtime-init";
 import { runAssignments, type ConductAssignment } from "../batch";
 import * as workers from "../worker";
+import * as reviewers from "../reviewer";
+import * as verification from "../verification";
+import type { ReviewFinding } from "../review-types";
 import * as candidates from "../candidates";
 import { readMarkerFile, selectMarker } from "../selection";
 
@@ -144,6 +147,279 @@ function result(aborted = false): SingleResult {
     resolvedModel: "batch-test/worker",
   };
 }
+
+const finding: ReviewFinding = {
+  id: "wrong-value",
+  file: "a.ts",
+  line: 1,
+  severity: "medium",
+  title: "Wrong value",
+  evidence: "Value is 2",
+  expected: "Export value 3",
+};
+
+test("review findings drive a fresh correction and clean cumulative review before readiness", async () => {
+  const { input, root } = await fixture();
+  input.assignments = input.assignments.slice(0, 1);
+  let calls = 0;
+  const worker = spyOn(workers, "runWorker").mockImplementation(async (request) => {
+    calls++;
+    if (calls === 2) expect(request.assignment).toContain("wrong-value");
+    await Bun.write(path.join(request.root, "a.ts"), `export const a = ${calls + 1};\n`);
+    return result();
+  });
+  const reviewer = spyOn(reviewers, "runReviewer").mockImplementation(async (request) => {
+    expect(request.patch).toContain("-export const a = 1;");
+    expect(request.patch).toContain(`+export const a = ${request.pass + 1};`);
+    if (request.pass === 2)
+      expect(request.previous[0]!.review!.findings[0]!.id).toBe("wrong-value");
+    return {
+      result: result(),
+      report: { summary: "Review complete", findings: request.pass === 1 ? [finding] : [] },
+    };
+  });
+  restores.push(
+    () => worker.mockRestore(),
+    () => reviewer.mockRestore(),
+  );
+  const [entry] = await runAssignments({ ...input, reviewerModel: "batch-test/worker" });
+  expect(entry!.details.status).toBe("ready");
+  expect(calls).toBe(2);
+  const retained = await candidates.inspectCandidate(
+    input.storeDir,
+    root,
+    entry!.details.candidate.id,
+  );
+  expect(retained.patch).toContain("+export const a = 3;");
+  expect(retained.candidate.review?.status).toBe("clean");
+  expect(retained.candidate.review?.passes.map((pass) => pass.review?.findings.length)).toEqual([
+    1, 0,
+  ]);
+  expect(await fs.readFile(path.join(root, "a.ts"), "utf8")).toBe("export const a = 1;\n");
+});
+
+test("review pass cap retains needs-attention and refuses human application", async () => {
+  const { input, root } = await fixture();
+  input.assignments = input.assignments.slice(0, 1);
+  const worker = spyOn(workers, "runWorker").mockImplementation(async (request) => {
+    await Bun.write(path.join(request.root, "a.ts"), "export const a = 2;\n");
+    return result();
+  });
+  const reviewer = spyOn(reviewers, "runReviewer").mockImplementation(async () => ({
+    result: result(),
+    report: { summary: "Still wrong", findings: [finding] },
+  }));
+  restores.push(
+    () => worker.mockRestore(),
+    () => reviewer.mockRestore(),
+  );
+  const [entry] = await runAssignments({
+    ...input,
+    reviewerModel: "batch-test/worker",
+    reviewPasses: 2,
+  });
+  expect(entry!.details.status).toBe("needs-attention");
+  expect(worker).toHaveBeenCalledTimes(2);
+  expect(reviewer).toHaveBeenCalledTimes(2);
+  const view = await candidates.inspectCandidate(input.storeDir, root, entry!.details.candidate.id);
+  expect(view.candidate.review?.passes).toHaveLength(2);
+  await expect(
+    candidates.applyCandidate(input.storeDir, root, view.candidate.id, view.reviewToken ?? ""),
+  ).rejects.toThrow();
+});
+
+test("empty review findings cannot override failed configured verification", async () => {
+  const { input } = await fixture();
+  input.assignments = input.assignments.slice(0, 1);
+  const worker = spyOn(workers, "runWorker").mockImplementation(async (request) => {
+    await Bun.write(path.join(request.root, "a.ts"), "export const a = 2;\n");
+    return result();
+  });
+  const reviewer = spyOn(reviewers, "runReviewer").mockImplementation(async () => ({
+    result: result(),
+    report: { summary: "No code findings", findings: [] },
+  }));
+  const verify = spyOn(verification, "runVerification").mockImplementation(async () => ({
+    argv: ["false"],
+    status: "failed",
+    exitCode: 1,
+    output: "assertion failed",
+    truncated: false,
+    durationMs: 1,
+  }));
+  restores.push(
+    () => worker.mockRestore(),
+    () => reviewer.mockRestore(),
+    () => verify.mockRestore(),
+  );
+  const [entry] = await runAssignments({
+    ...input,
+    reviewerModel: "batch-test/worker",
+    reviewPasses: 2,
+    verification: { argv: ["false"], timeoutMs: 120000 },
+  });
+  expect(entry!.details.status).toBe("needs-attention");
+  expect(entry!.details.candidate.review?.passes.map((pass) => pass.verification?.status)).toEqual([
+    "failed",
+    "failed",
+  ]);
+  expect(worker).toHaveBeenCalledTimes(2);
+});
+
+test("verification without reviewer runs once and does not launch corrections", async () => {
+  const { input } = await fixture();
+  input.assignments = input.assignments.slice(0, 1);
+  const worker = spyOn(workers, "runWorker").mockImplementation(async (request) => {
+    await Bun.write(path.join(request.root, "a.ts"), "export const a = 2;\n");
+    return result();
+  });
+  const reviewer = spyOn(reviewers, "runReviewer");
+  const verify = spyOn(verification, "runVerification").mockImplementation(async () => ({
+    argv: ["false"],
+    status: "failed",
+    exitCode: 1,
+    output: "failure",
+    truncated: false,
+    durationMs: 1,
+  }));
+  restores.push(
+    () => worker.mockRestore(),
+    () => reviewer.mockRestore(),
+    () => verify.mockRestore(),
+  );
+  const [entry] = await runAssignments({
+    ...input,
+    verification: { argv: ["false"], timeoutMs: 120000 },
+  });
+  expect(entry!.details.status).toBe("needs-attention");
+  expect(worker).toHaveBeenCalledTimes(1);
+  expect(verify).toHaveBeenCalledTimes(1);
+  expect(reviewer).not.toHaveBeenCalled();
+});
+
+test("cancelled correction retains the preceding review and verification evidence", async () => {
+  const { input, controller, root } = await fixture();
+  input.assignments = input.assignments.slice(0, 1);
+  let calls = 0;
+  const worker = spyOn(workers, "runWorker").mockImplementation(async (request) => {
+    if (++calls === 2) {
+      controller.abort();
+      return result(true);
+    }
+    await Bun.write(path.join(request.root, "a.ts"), "export const a = 2;\n");
+    return result();
+  });
+  const reviewer = spyOn(reviewers, "runReviewer").mockImplementation(async () => ({
+    result: result(),
+    report: { summary: "Needs correction", findings: [finding] },
+  }));
+  const verify = spyOn(verification, "runVerification").mockImplementation(async () => ({
+    argv: ["true"],
+    status: "passed",
+    exitCode: 0,
+    output: "test evidence",
+    truncated: false,
+    durationMs: 1,
+  }));
+  restores.push(
+    () => worker.mockRestore(),
+    () => reviewer.mockRestore(),
+    () => verify.mockRestore(),
+  );
+  const [entry] = await runAssignments({
+    ...input,
+    reviewerModel: "batch-test/worker",
+    verification: { argv: ["true"], timeoutMs: 120000 },
+  });
+  expect(entry!.details.status).toBe("cancelled");
+  const saved = await candidates.load(input.storeDir, root, entry!.details.candidate.id);
+  expect(saved.review?.status).toBe("cancelled");
+  expect(saved.review?.passes[0]?.verification?.output).toBe("test evidence");
+  expect(saved.review?.passes[0]?.review?.findings[0]?.id).toBe("wrong-value");
+  expect(saved.review?.passes[1]?.error).toContain("cancelled");
+});
+
+test("read-only reviewer mutation fails even inside the writable candidate scope", async () => {
+  const { input } = await fixture();
+  input.assignments = input.assignments.slice(0, 1);
+  const worker = spyOn(workers, "runWorker").mockImplementation(async (request) => {
+    await Bun.write(path.join(request.root, "a.ts"), "export const a = 2;\n");
+    return result();
+  });
+  const reviewer = spyOn(reviewers, "runReviewer").mockImplementation(async (request) => {
+    await Bun.write(path.join(request.root, "a.ts"), "export const a = 99;\n");
+    return { result: result(), report: { summary: "Claimed clean", findings: [] } };
+  });
+  restores.push(
+    () => worker.mockRestore(),
+    () => reviewer.mockRestore(),
+  );
+  const [entry] = await runAssignments({ ...input, reviewerModel: "batch-test/worker" });
+  expect(entry!.details.status).toBe("failed");
+  expect(entry!.details.candidate.error).toContain("reviewer changed");
+  expect(entry!.details.candidate.review?.passes[0]?.review?.summary).toBe("Claimed clean");
+});
+
+test("trusted verification cannot change the reviewed candidate while claiming a pass", async () => {
+  const { input } = await fixture();
+  input.assignments = input.assignments.slice(0, 1);
+  const worker = spyOn(workers, "runWorker").mockImplementation(async (request) => {
+    await Bun.write(path.join(request.root, "a.ts"), "export const a = 2;\n");
+    return result();
+  });
+  const reviewer = spyOn(reviewers, "runReviewer");
+  const verify = spyOn(verification, "runVerification").mockImplementation(async (request) => {
+    await Bun.write(path.join(request.root, "a.ts"), "export const a = 99;\n");
+    return {
+      argv: ["true"],
+      status: "passed",
+      exitCode: 0,
+      output: "claimed passed",
+      truncated: false,
+      durationMs: 1,
+    };
+  });
+  restores.push(
+    () => worker.mockRestore(),
+    () => reviewer.mockRestore(),
+    () => verify.mockRestore(),
+  );
+  const [entry] = await runAssignments({
+    ...input,
+    reviewerModel: "batch-test/worker",
+    verification: { argv: ["true"], timeoutMs: 120000 },
+  });
+  expect(entry!.details.status).toBe("failed");
+  expect(entry!.details.candidate.error).toContain("changed during verification");
+  expect(entry!.details.candidate.review?.passes[0]?.verification?.output).toBe("claimed passed");
+  expect(reviewer).not.toHaveBeenCalled();
+});
+
+test("malformed reviewer output preserves failure artifacts and never becomes ready", async () => {
+  const { input, root } = await fixture();
+  input.assignments = input.assignments.slice(0, 1);
+  const worker = spyOn(workers, "runWorker").mockImplementation(async (request) => {
+    await Bun.write(path.join(request.root, "a.ts"), "export const a = 2;\n");
+    return result();
+  });
+  const reviewer = spyOn(reviewers, "runReviewer").mockImplementation(async () => {
+    throw new reviewers.ReviewerError("Invalid review", {
+      ...result(),
+      id: "invalid-review-id",
+      outputPath: "/retained/review",
+    });
+  });
+  restores.push(
+    () => worker.mockRestore(),
+    () => reviewer.mockRestore(),
+  );
+  const [entry] = await runAssignments({ ...input, reviewerModel: "batch-test/worker" });
+  expect(entry!.details.status).toBe("failed");
+  const saved = await candidates.load(input.storeDir, root, entry!.details.candidate.id);
+  expect(saved.review?.passes[0]?.error).toContain("Invalid review");
+  expect(saved.review?.passes[0]?.reviewer?.outputPath).toBe("/retained/review");
+  expect(saved.review?.passes[0]?.reviewer?.id).toBe("invalid-review-id");
+});
 
 test("post-save cleanup failure reports the persisted candidate without inventing recovery bytes", async () => {
   const { root, input } = await fixture();

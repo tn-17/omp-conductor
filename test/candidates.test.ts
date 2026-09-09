@@ -9,6 +9,8 @@ import {
   inspectCandidate,
   listCandidates,
   prepareCandidate,
+  readCandidatePatch,
+  load,
   recoverCandidates,
   rejectCandidate,
   type PreparedCandidate,
@@ -90,6 +92,92 @@ async function ready(
   const review = await inspectCandidate(storeDir, root, record.id);
   return { id: record.id, reviewToken: review.reviewToken! };
 }
+
+test("cumulative review patch preserves original baseline and final capture authority", async () => {
+  const { root, storeDir } = await workspace();
+  const prepared = await prepare(root, storeDir);
+  await fs.writeFile(path.join(prepared.worktree, "source.txt"), "first\n");
+  const first = await readCandidatePatch(prepared);
+  expect(first).toContain("-original");
+  expect(first).toContain("+first");
+  expect((await load(storeDir, root, prepared.candidate.id)).status).toBe("running");
+  expect(await fs.readFile(prepared.candidate.patchPath, "utf8")).toBe("");
+  await fs.writeFile(path.join(prepared.worktree, "source.txt"), "corrected\n");
+  const corrected = await readCandidatePatch(prepared);
+  expect(corrected).toContain("-original");
+  expect(corrected).toContain("+corrected");
+  expect(corrected).not.toContain("-first");
+  const finished = await finishCandidate(prepared, { status: "completed" });
+  expect(finished.status).toBe("ready");
+  const view = await inspectCandidate(storeDir, root, finished.id);
+  expect(view.patch).toBe(corrected);
+  await applyCandidate(storeDir, root, finished.id, view.reviewToken!);
+  expect(await fs.readFile(path.join(root, "source.txt"), "utf8")).toBe("corrected\n");
+});
+
+test("review patch rejects context writes and still retains the unsafe final patch", async () => {
+  const { root, storeDir } = await workspace();
+  const prepared = await prepare(root, storeDir);
+  await fs.writeFile(path.join(prepared.worktree, "other.txt"), "unsafe\n");
+  await expect(readCandidatePatch(prepared)).rejects.toThrow("out-of-scope");
+  const finished = await finishCandidate(prepared, { status: "failed" });
+  expect(finished.status).toBe("failed");
+  expect(await fs.readFile(finished.patchPath, "utf8")).toContain("+unsafe");
+  expect(await fs.readFile(path.join(root, "other.txt"), "utf8")).toBe("other\n");
+});
+
+test("review configuration is cloned and persisted and invalid restored passes fail closed", async () => {
+  const { root, storeDir } = await workspace();
+  const argv = ["test-command", "literal argument"];
+  const prepared = await prepareCandidate({
+    cwd: root,
+    storeDir,
+    files: ["source.txt"],
+    directive: "implement",
+    assignment: "change",
+    brief: {
+      context: "Existing source",
+      fixedDecisions: [],
+      acceptance: ["Change"],
+      model: "test/worker",
+      reviewerModel: "test/reviewer",
+      reviewerFast: true,
+      reviewPasses: 2,
+      verification: { argv, timeoutMs: 120000 },
+    },
+  });
+  snapshots.push(prepared);
+  argv[0] = "different-command";
+  expect(prepared.candidate.brief!.verification!.argv[0]).toBe("test-command");
+  const saved = await load(storeDir, root, prepared.candidate.id);
+  expect(saved.brief!.reviewerModel).toBe("test/reviewer");
+  const recordPath = path.join(storeDir, saved.id, "record.json");
+  await fs.writeFile(
+    recordPath,
+    JSON.stringify({ ...saved, brief: { ...saved.brief, reviewPasses: 11 } }),
+  );
+  await expect(load(storeDir, root, saved.id)).rejects.toThrow("between 1 and 10");
+});
+
+test("review evidence is bound to the human application token", async () => {
+  const { root, storeDir } = await workspace();
+  const prepared = await prepare(root, storeDir);
+  await fs.writeFile(path.join(prepared.worktree, "source.txt"), "candidate\n");
+  const finished = await finishCandidate(prepared, {
+    status: "completed",
+    review: {
+      status: "clean",
+      passes: [{ pass: 1, review: { summary: "Reviewed original evidence", findings: [] } }],
+    },
+  });
+  const view = await inspectCandidate(storeDir, root, finished.id);
+  const filename = path.join(storeDir, finished.id, "record.json");
+  const saved = await load(storeDir, root, finished.id);
+  saved.review!.passes[0]!.review!.summary = "Replaced evidence";
+  await fs.writeFile(filename, JSON.stringify(saved));
+  await expect(applyCandidate(storeDir, root, finished.id, view.reviewToken!)).rejects.toThrow();
+  expect(await fs.readFile(path.join(root, "source.txt"), "utf8")).toBe("original\n");
+});
 
 test("snapshot includes staged, unstaged and untracked bytes and later source edits cannot enter the worker", async () => {
   const { root, storeDir } = await workspace();

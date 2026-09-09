@@ -4,6 +4,8 @@ import * as path from "node:path";
 import * as os from "node:os";
 import { createHash, randomUUID } from "node:crypto";
 import { IsoBackendKind } from "@oh-my-pi/pi-natives";
+import type { ReviewHistory, VerificationConfig } from "./review-types";
+import { validateVerification } from "./verification";
 import {
   cleanupIsolation,
   ensureIsolation,
@@ -14,6 +16,7 @@ import {
 export type CandidateStatus =
   | "running"
   | "ready"
+  | "needs-attention"
   | "failed"
   | "cancelled"
   | "rejected"
@@ -29,6 +32,10 @@ export interface CandidateBrief {
   readonly advisorModel?: string;
   readonly workerFast?: boolean;
   readonly advisorFast?: boolean;
+  readonly reviewerModel?: string;
+  readonly reviewerFast?: boolean;
+  readonly reviewPasses?: number;
+  readonly verification?: VerificationConfig;
 }
 export interface CandidateRecord {
   version: 1;
@@ -41,6 +48,7 @@ export interface CandidateRecord {
   directive: string;
   assignment: string;
   brief?: CandidateBrief;
+  review?: ReviewHistory;
   changes: string[];
   patchPath: string;
   reviewToken?: string;
@@ -66,6 +74,7 @@ const message = (error: unknown) => (error instanceof Error ? error.message : St
 const statuses: Record<CandidateStatus, true> = {
   running: true,
   ready: true,
+  "needs-attention": true,
   failed: true,
   cancelled: true,
   rejected: true,
@@ -227,6 +236,78 @@ export async function load(store: string, cwd: string, id: string): Promise<Cand
       !/^[^/\s]+\/\S+$/.test(record.brief.advisorModel))
   )
     throw new Error("Invalid candidate advisor model");
+  if (record.brief) validateReviewConfig(record.brief);
+  if (record.review !== undefined) {
+    const history = record.review;
+    if (
+      !history ||
+      !["clean", "needs-attention", "failed", "cancelled"].includes(history.status) ||
+      !Array.isArray(history.passes) ||
+      history.passes.length > (record.brief?.reviewPasses ?? 3)
+    )
+      throw new Error("Invalid candidate review history");
+    for (const [index, pass] of history.passes.entries()) {
+      if (!pass || pass.pass !== index + 1) throw new Error("Invalid candidate review pass");
+      if (pass.verification !== undefined) {
+        const report = pass.verification;
+        if (
+          !report ||
+          !Array.isArray(report.argv) ||
+          !report.argv.length ||
+          !report.argv.every((arg) => typeof arg === "string" && !arg.includes("\0")) ||
+          !["passed", "failed", "cancelled", "timed-out"].includes(report.status) ||
+          !(report.exitCode === null || Number.isInteger(report.exitCode)) ||
+          typeof report.output !== "string" ||
+          typeof report.truncated !== "boolean" ||
+          !Number.isFinite(report.durationMs) ||
+          report.durationMs < 0 ||
+          (report.status === "passed" && report.exitCode !== 0)
+        )
+          throw new Error("Invalid candidate verification report");
+      }
+      if (pass.review !== undefined) {
+        if (
+          !pass.review ||
+          typeof pass.review.summary !== "string" ||
+          !pass.review.summary.trim() ||
+          !Array.isArray(pass.review.findings)
+        )
+          throw new Error("Invalid candidate review report");
+        const ids = new Set<string>();
+        for (const finding of pass.review.findings) {
+          if (
+            !finding ||
+            ![finding.id, finding.file, finding.title, finding.evidence, finding.expected].every(
+              (value) => typeof value === "string" && value.trim().length > 0,
+            ) ||
+            ids.has(finding.id) ||
+            !record.files.includes(finding.file) ||
+            !Number.isInteger(finding.line) ||
+            finding.line < 1 ||
+            !["high", "medium", "low"].includes(finding.severity)
+          )
+            throw new Error("Invalid candidate review finding");
+          ids.add(finding.id);
+        }
+      }
+    }
+    if (history.status === "clean") {
+      const last = history.passes.at(-1);
+      if (
+        !last ||
+        last.error ||
+        (record.brief?.reviewerModel && (!last.review || last.review.findings.length > 0)) ||
+        (record.brief?.verification && last.verification?.status !== "passed")
+      )
+        throw new Error("Invalid clean candidate review");
+    }
+  }
+  if (
+    record.status === "ready" &&
+    (record.brief?.reviewerModel || record.brief?.verification) &&
+    record.review?.status !== "clean"
+  )
+    throw new Error("Candidate requires a clean retained review");
   for (const key of ["workerFast", "advisorFast"] as const) {
     if (record.brief?.[key] !== undefined && typeof record.brief[key] !== "boolean")
       throw new Error("Invalid candidate fast preference");
@@ -403,6 +484,27 @@ export async function resolveCandidateScope(cwdPath: string, requestedFiles: str
   return { cwd, root, files, sourceStates };
 }
 
+export function validateReviewConfig(brief: {
+  reviewerModel?: string;
+  reviewerFast?: boolean;
+  reviewPasses?: number;
+  verification?: VerificationConfig;
+}): void {
+  if (
+    brief.reviewerModel !== undefined &&
+    (typeof brief.reviewerModel !== "string" || !/^[^/\s]+\/\S+$/.test(brief.reviewerModel))
+  )
+    throw new Error("Invalid candidate reviewer model");
+  if (brief.reviewerFast !== undefined && typeof brief.reviewerFast !== "boolean")
+    throw new Error("Invalid candidate reviewer fast preference");
+  if (
+    brief.reviewPasses !== undefined &&
+    (!Number.isInteger(brief.reviewPasses) || brief.reviewPasses < 1 || brief.reviewPasses > 10)
+  )
+    throw new Error("Review passes must be an integer between 1 and 10");
+  if (brief.verification !== undefined) validateVerification(brief.verification);
+}
+
 export async function prepareCandidate(input: {
   cwd: string;
   storeDir: string;
@@ -431,6 +533,7 @@ export async function prepareCandidate(input: {
     throw new Error(
       "Candidate requires meaningful context, fixedDecisions, acceptance, and model.",
     );
+  validateReviewConfig(input.brief);
   const brief: CandidateBrief = Object.freeze({
     context: input.brief.context,
     fixedDecisions: Object.freeze([...input.brief.fixedDecisions]),
@@ -438,6 +541,19 @@ export async function prepareCandidate(input: {
     model: input.brief.model,
     workerFast: input.brief.workerFast === true,
     advisorFast: input.brief.advisorFast === true,
+    reviewerFast: input.brief.reviewerFast === true,
+    reviewPasses: input.brief.reviewPasses ?? 3,
+    ...(input.brief.reviewerModel === undefined
+      ? {}
+      : { reviewerModel: input.brief.reviewerModel }),
+    ...(input.brief.verification === undefined
+      ? {}
+      : {
+          verification: Object.freeze({
+            argv: Object.freeze([...input.brief.verification.argv]),
+            timeoutMs: input.brief.verification.timeoutMs,
+          }),
+        }),
     ...(input.brief.advisorModel === undefined ? {} : { advisorModel: input.brief.advisorModel }),
   });
   const { cwd, root, files, sourceStates } = await resolveCandidateScope(input.cwd, input.files);
@@ -524,10 +640,52 @@ export async function prepareCandidate(input: {
     throw error;
   }
 }
+async function captureDelta(
+  prepared: PreparedCandidate,
+  retain?: (captured: { patch: Buffer; changes: string[]; finalTree: string }) => Promise<void>,
+) {
+  const record = prepared.candidate;
+  const gitDir = path.join(prepared.worktree, ".git");
+  if (prepared.metadata !== (await scanMetadata(gitDir)))
+    throw new Error("Worker changed Git metadata");
+  const finalTree = await tree(gitDir, prepared.worktree, record.files);
+  const captured = await delta(gitDir, prepared.worktree, record.baselineTree, finalTree);
+  await retain?.({ ...captured, finalTree });
+  const entries = (await git(gitDir, prepared.worktree, ["ls-tree", "-r", "-z", finalTree])).split(
+    "\0",
+  );
+  // These index/object changes are our own; later scope rejection must still
+  // allow final capture to retain the unsafe patch for human inspection.
+  prepared.metadata = await scanMetadata(gitDir);
+  if (entries.some((entry) => entry.startsWith("160000 ")))
+    throw new Error("Worker introduced an unsupported Gitlink");
+  const currentManifest = await manifest(gitDir, prepared.worktree);
+  const before = new Map<string, string>(
+    (JSON.parse(prepared.manifest) as string[]).map((entry) => [entry.split("\0")[0]!, entry]),
+  );
+  const after = new Map<string, string>(
+    (JSON.parse(currentManifest) as string[]).map((entry) => [entry.split("\0")[0]!, entry]),
+  );
+  for (const file of new Set([...before.keys(), ...after.keys()])) {
+    if (before.get(file) !== after.get(file) && !captured.changes.includes(file))
+      throw new Error(`Unsupported filesystem-only change: ${file}`);
+  }
+  for (const file of captured.changes) {
+    if (!record.files.includes(file)) throw new Error(`Worker changed out-of-scope file: ${file}`);
+    await state(prepared.worktree, file);
+  }
+  return { ...captured, finalTree };
+}
+
+export async function readCandidatePatch(prepared: PreparedCandidate): Promise<string> {
+  return utf8.decode((await captureDelta(prepared)).patch);
+}
+
 export async function finishCandidate(
   prepared: PreparedCandidate,
   outcome: {
-    status: "completed" | "failed" | "cancelled";
+    status: "completed" | "needs-attention" | "failed" | "cancelled";
+    review?: ReviewHistory;
     model?: string;
     id?: string;
     outputPath?: string;
@@ -543,45 +701,32 @@ export async function finishCandidate(
   };
   record.status = outcome.status === "completed" ? "ready" : outcome.status;
   record.error = outcome.error;
+  record.review = outcome.review;
+  if (
+    record.status === "ready" &&
+    (record.brief?.reviewerModel || record.brief?.verification) &&
+    record.review?.status !== "clean"
+  ) {
+    record.status = "failed";
+    record.error =
+      "Candidate requires a clean retained review and successful configured verification.";
+  }
   let capturedSafely = false;
   try {
-    const gitDir = path.join(prepared.worktree, ".git");
-    // Never execute Git against configuration or metadata a worker modified.
-    if (prepared.metadata !== (await scanMetadata(gitDir)))
-      throw new Error("Worker changed Git metadata");
-    record.finalTree = await tree(gitDir, prepared.worktree, record.files);
-    const captured = await delta(gitDir, prepared.worktree, record.baselineTree, record.finalTree);
-    record.changes = captured.changes;
-    record.patchHash = digest(captured.patch);
-    await fs.writeFile(record.patchPath, captured.patch, { mode: 0o600 });
-    const entries = (
-      await git(gitDir, prepared.worktree, ["ls-tree", "-r", "-z", record.finalTree])
-    ).split("\0");
-    if (entries.some((entry) => entry.startsWith("160000 ")))
-      throw new Error("Worker introduced an unsupported Gitlink");
-    const currentManifest = await manifest(gitDir, prepared.worktree);
-    const before = new Map<string, string>(
-      (JSON.parse(prepared.manifest) as string[]).map((entry) => [entry.split("\0")[0]!, entry]),
-    );
-    const after = new Map<string, string>(
-      (JSON.parse(currentManifest) as string[]).map((entry) => [entry.split("\0")[0]!, entry]),
-    );
-    for (const file of new Set([...before.keys(), ...after.keys()])) {
-      if (before.get(file) !== after.get(file) && !record.changes.includes(file))
-        throw new Error(`Unsupported filesystem-only change: ${file}`);
-    }
-    for (const file of record.changes) {
-      if (!record.files.includes(file))
-        throw new Error(`Worker changed out-of-scope file: ${file}`);
-      await state(prepared.worktree, file);
-    }
+    await captureDelta(prepared, async (captured) => {
+      record.finalTree = captured.finalTree;
+      record.changes = captured.changes;
+      record.patchHash = digest(captured.patch);
+      await fs.writeFile(record.patchPath, captured.patch, { mode: 0o600 });
+    });
     capturedSafely = true;
-    if (outcome.status === "completed" && !record.changes.length) {
+    if (record.status === "ready" && !record.changes.length) {
       record.status = "rejected";
       record.error = "Worker produced no candidate changes.";
     }
   } catch (error) {
     record.status = outcome.status === "cancelled" ? "cancelled" : "failed";
+    if (record.review) record.review.status = record.status;
     record.error = [record.error, message(error)].filter(Boolean).join("; ");
   }
   // A failed capture may not represent all worker bytes; preserve its snapshot for recovery.
