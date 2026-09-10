@@ -201,7 +201,7 @@ export default function conductExtension(pi: ExtensionAPI): void {
 
   function updateStatus(ctx: ExtensionContext): void {
     ctx.ui.setStatus(
-      "conduct",
+      "conductor",
       state.enabled
         ? `Conduct: on | workers ${state.workers} | advisor ${state.advisorModel ?? "off"} | requested fast worker ${state.workerFast === true ? "on" : "off"}, advisor ${state.advisorFast === true ? "on" : "off"} | ${reviewStatus()}${running ? (running.phase === "worker" ? ` | ${stageStatus()}` : " | capturing candidates") : ""}`
         : undefined,

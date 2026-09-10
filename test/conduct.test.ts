@@ -130,6 +130,27 @@ test("registers /conductor without the former /conduct alias", async () => {
   expect(runner.getCommand("conduct")).toBeUndefined();
 });
 
+test("uses the conductor key for the OMP status line", async () => {
+  const session = await openSession();
+  await command(session, "model conduct-test/worker");
+  const runner = session.extensionRunner!;
+  const ctx = runner.createCommandContext();
+  const statuses: [string, string | undefined][] = [];
+  const commandContext = {
+    ...ctx,
+    ui: {
+      ...ctx.ui,
+      setStatus: (key: string, value: string | undefined) => {
+        statuses.push([key, value]);
+      },
+    },
+  };
+
+  await runner.getCommand("conductor")!.handler("on", commandContext);
+
+  expect(statuses).toContainEqual(["conductor", expect.any(String)]);
+});
+
 test("verification configuration preserves exact quoted argv and rejects malformed input", async () => {
   const session = await openSession();
   await command(session, 'verify executable "" expected');
