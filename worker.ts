@@ -90,10 +90,42 @@ export async function runWorker(input: {
   let advisor: AgentSession["agent"] | undefined;
   let unsubscribe: (() => void) | undefined;
   let unsubscribeAdvisor: (() => void) | undefined;
-  const fail = (message: string) => {
-    failure ??= new Error(`Conduct advisor: ${message}`);
+  let unsubscribeExecution: (() => void) | undefined;
+  const fail = (message: string, source = "advisor") => {
+    if (signal.aborted) return;
+    failure ??= new Error(`Conduct ${source}: ${message}`);
     setupAbort.abort(failure);
+    child?.agent.abort();
     advisor?.abort();
+  };
+  let stalledMutations = 0;
+  const observedMutations = new WeakSet<object>();
+  const observeMutation = (toolName: string, result: unknown, isError: boolean) => {
+    if (!result || typeof result !== "object") return;
+    const details = "details" in result ? result.details : undefined;
+    // Core result coercion retains details by identity, while reconstructing
+    // the outer result. Invocation-local identity also permits reused call IDs.
+    const identity = details && typeof details === "object" ? details : result;
+    if (
+      failure ||
+      signal.aborted ||
+      (toolName !== "conduct_write" && toolName !== "conduct_edit") ||
+      observedMutations.has(identity)
+    ) return;
+    observedMutations.add(identity);
+    const changed =
+      details && typeof details === "object" && "changed" in details ? details.changed : undefined;
+    if (!isError && changed === true) {
+      stalledMutations = 0;
+    } else if (isError || changed === false) {
+      stalledMutations++;
+      if (stalledMutations >= 3) {
+        fail(
+          "stopped after three failed or unchanged mutations without a genuine byte change; correct rejected arguments or report the unresolved blocker in a fresh dispatch.",
+          "worker",
+        );
+      }
+    }
   };
   const agent: AgentDefinition = {
     name: "conduct-worker",
@@ -150,6 +182,40 @@ export async function runWorker(input: {
     files: [...input.files],
     settings,
   });
+  // tool_call runs during batch preparation, not necessarily just before a
+  // queued call executes. Guard the actual boundary too, including provider
+  // bridges that invoke tools without native execution-end notifications.
+  let mutationQueue: Promise<unknown> = Promise.resolve();
+  for (const tool of customTools) {
+    const execute = tool.execute.bind(tool);
+    const mutation = tool.name === "conduct_write" || tool.name === "conduct_edit";
+    tool.execute = async (...args) => {
+      const run = async () => {
+        workerSignal.throwIfAborted();
+        try {
+          const result = await execute(...args);
+          if (mutation) {
+            result.details ??= {};
+            observeMutation(tool.name, result, result.isError === true);
+          }
+          return result;
+        } catch (error) {
+          if (!mutation) throw error;
+          const result = {
+            content: [{ type: "text" as const, text: error instanceof Error ? error.message : String(error) }],
+            details: {},
+            isError: true,
+          };
+          observeMutation(tool.name, result, true);
+          return result;
+        }
+      };
+      if (!mutation) return run();
+      const pending = mutationQueue.then(run);
+      mutationQueue = pending.catch(() => {});
+      return pending;
+    };
+  }
   agent.tools = customTools.map((tool) => tool.name);
   const allowedTools = new Set([...agent.tools, "yield"]);
   const policy: PreparedExtension = {
@@ -159,7 +225,20 @@ export async function runWorker(input: {
     factory(pi) {
       pi.on("before_agent_start", async () => {
         await pi.setActiveTools([...allowedTools]);
-        if (!advisorModel) return;
+        const nativeSession = AgentRegistry.global().get(id)?.session;
+        // Session extension notifications can wait behind persistence. Observe
+        // the same native event synchronously too, before queued writes start.
+        if (nativeSession && !unsubscribeExecution) {
+          unsubscribeExecution = nativeSession.agent.subscribe((event) => {
+            if (event.type === "tool_execution_end") {
+              observeMutation(event.toolName, event.result, event.isError === true);
+            }
+          });
+        }
+        if (!advisorModel) {
+          child = nativeSession ?? undefined;
+          return;
+        }
         try {
           const session = AgentRegistry.global().get(id)?.session;
           if (!session) throw new Error("native worker session was not registered before startup");
@@ -271,8 +350,14 @@ export async function runWorker(input: {
           fail(error instanceof Error ? error.message : String(error));
         }
       });
+      pi.on("tool_execution_end", (event) => {
+        observeMutation(event.toolName, event.result, event.isError);
+      });
       pi.on("tool_call", (event) => {
-        if (failure || (advisorModel && (!child || child.getAdvisorAgent() !== advisor))) {
+        if (workerSignal.aborted) {
+          return { block: true, reason: failure?.message ?? "Conduct worker was cancelled." };
+        }
+        if (advisorModel && (!child || child.getAdvisorAgent() !== advisor)) {
           fail("native advisor safety setup is unavailable or changed");
           return { block: true, reason: failure!.message };
         }
@@ -329,6 +414,8 @@ export async function runWorker(input: {
         deferredCleanup = completion;
       },
     });
+  } catch (error) {
+    throw failure ?? error;
   } finally {
     // Native executor drains final advice and disposes the isolated child.
     // Await late disposal and the advisor loop too before capturing files.
@@ -340,6 +427,7 @@ export async function runWorker(input: {
         await advisor?.waitForIdle();
       } finally {
         unsubscribeAdvisor?.();
+        unsubscribeExecution?.();
         unsubscribe?.();
       }
     }

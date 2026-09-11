@@ -236,6 +236,12 @@ Named `BEGIN`/`END` pairs must match, be unique, and not nest. Supported sources
 
 Implementers use guarded UTF-8 snapshot read/search/edit/write tools; reviewers use only the read/search subset and completion. These are not the full native OMP tool transports: shell/Eval, unrestricted LSP/MCP, document conversion, archive/database mutation, and symlink/hardlink access are unavailable. Reads are limited to 4 MiB and 2,000 lines per call; search skips binary and oversized files. Unsupported resources require supplied read-only context, not a permission bypass.
 
+Conduct tools use their own strict JSON schemas, not the generic OMP tool arguments. Extra fields, legacy edit shapes, empty edit batches, and invalid numeric bounds are rejected. Tool descriptions include JSON examples; malformed arguments receive correction guidance, while access restrictions still require fresh human-authorized scope.
+
+Writes report UTF-8 byte counts and skip physical writes when the bytes are unchanged. Empty content remains valid for deliberate truncation or empty-file creation, not placeholder calls. Native edit validation remains authoritative; an identical replacement can be rejected without changing any file.
+
+A worker stops after three failed or unchanged edit/write attempts without a genuine file change. Reads do not reset this count; a successful byte change does. The guard covers SDK argument-validation failures and direct tool execution, blocks subsequent queued mutations, and reports a failed worker rather than successful completion. Cleanup still settles before candidate capture. This bounds no-progress mutation loops, not every possible reasoning or read-only loop.
+
 The current native executor can auto-import executable custom-command modules before tool guards run. Conductor therefore refuses worker/reviewer startup when such repository or user modules are discovered. This is a fail-closed compatibility restriction; do not remove user configuration or bypass the check to force a run.
 
 ## Development

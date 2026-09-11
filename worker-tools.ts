@@ -7,8 +7,10 @@ import { EditSession, EditStore, editInspect, search } from "@oh-my-pi/pi-native
 
 const freshScope =
   "Stop and request fresh human-authorized scope (requested files and reason); dispatch a fresh candidate after authorization.";
+class AccessError extends Error {}
 interface TextResult {
   content: { type: "text"; text: string }[];
+  details?: { changed: boolean };
 }
 const text = (value: string): TextResult => ({ content: [{ type: "text", text: value }] });
 const forbiddenPath = /[:%;\\*?[\]{}\p{Cc}]/u;
@@ -77,14 +79,14 @@ export async function createWorkerTools(input: {
         if (absent && (error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
         throw error;
       }
-      if (stat.isSymbolicLink()) throw new Error(`Symlink access is forbidden: ${current}`);
+      if (stat.isSymbolicLink()) throw new AccessError(`Symlink access is forbidden: ${current}`);
       if (index !== components.length - 1 && !stat.isDirectory())
         throw new Error(`Non-directory ancestor: ${current}`);
       if (index === components.length - 1) {
         if (!stat.isFile() && !stat.isDirectory())
           throw new Error(`Only regular files and directories are accessible: ${current}`);
         if (stat.isFile() && stat.nlink > 1)
-          throw new Error(`Hard-linked files are forbidden: ${current}`);
+          throw new AccessError(`Hard-linked files are forbidden: ${current}`);
         return stat;
       }
     }
@@ -95,9 +97,9 @@ export async function createWorkerTools(input: {
       throw new Error(`Only plain filesystem paths are supported: ${JSON.stringify(value)}`);
     }
     if (value.split("/").some((part) => part.toLowerCase() === ".git"))
-      throw new Error("Git metadata access is forbidden");
+      throw new AccessError("Git metadata access is forbidden");
     const target = path.resolve(base, value);
-    if (!within(root, target)) throw new Error(`Path is outside the snapshot: ${value}`);
+    if (!within(root, target)) throw new AccessError(`Path is outside the snapshot: ${value}`);
     return target;
   }
   const allowed = new Set<string>();
@@ -111,7 +113,7 @@ export async function createWorkerTools(input: {
   async function writable(value: string): Promise<string> {
     const target = resolve(value);
     if (!allowed.has(target))
-      throw new Error(`Mutation target is not in the exact file allowlist: ${value}`);
+      throw new AccessError(`Mutation target is not in the exact file allowlist: ${value}`);
     if (containerFile.test(target)) throw new Error("Archive and database mutation is unsupported");
     const stat = await inspect(target, true);
     if (stat && !stat.isFile()) throw new Error(`Mutation target is not a regular file: ${value}`);
@@ -147,6 +149,13 @@ export async function createWorkerTools(input: {
     await visit(target);
     return result;
   }
+  const examples: Record<string, string> = {
+    conduct_read: '{"path":"src/allowed.ts","startLine":1,"endLine":100}',
+    conduct_glob: '{"pattern":"**/*.ts","path":".","limit":200}',
+    conduct_grep: '{"pattern":"name","path":".","ignoreCase":false,"limit":200}',
+    conduct_edit: '{"edits":[{"path":"src/allowed.ts","old_string":"before","new_string":"after","replace_all":false}]}',
+    conduct_write: '{"path":"src/allowed.ts","content":"replacement text\\n"}',
+  };
   // Serialize worker calls, including reads, so their own mutations cannot race preflight.
   let pending: Promise<unknown> = Promise.resolve();
   function tool(
@@ -159,7 +168,7 @@ export async function createWorkerTools(input: {
     return {
       name,
       label: name,
-      description: `${description} Paths are relative to worker cwd; no URIs, selectors, symlinks or Git metadata. ${freshScope}`,
+      description: `${description} JSON example: ${examples[name]}. Use only this tool's fields; no extra i, offset, selectors, XML or legacy schemas. Paths are relative to worker cwd; no URIs, selectors, symlinks or Git metadata. Access restrictions require fresh authorization; malformed arguments should be corrected and retried.`,
       loadMode: "essential",
       strict: true,
       parameters,
@@ -172,7 +181,9 @@ export async function createWorkerTools(input: {
           } catch (error) {
             return {
               ...text(
-                `Blocked or failed: ${error instanceof Error ? error.message : String(error)}. ${freshScope}`,
+                error instanceof AccessError
+                  ? `Access blocked: ${error.message}. ${freshScope}`
+                  : `Failed: ${error instanceof Error ? error.message : String(error)}. Correct the arguments or matching text and retry. JSON example: ${examples[name]}. No extra i, offset, selectors, XML or legacy schemas; access restrictions still apply.`,
               ),
               isError: true,
             };
@@ -183,17 +194,24 @@ export async function createWorkerTools(input: {
       },
     };
   }
+  const plainPath = type("string").atLeastLength(1);
+  const positiveInteger = (maximum: number) =>
+    type("number").atLeast(1).atMost(maximum).divisibleBy(1).or("null");
   const editEntry = type({
-    path: "string",
+    path: plainPath,
     old_string: "string",
     new_string: "string",
     "replace_all?": "boolean | null",
-  });
+  }).onDeepUndeclaredKey("reject");
   return [
     tool(
       "conduct_read",
       "Read plain UTF-8 text with optional inclusive line range, or list a directory's immediate safe entries. Null optional fields use defaults.",
-      type({ path: "string", "startLine?": "number | null", "endLine?": "number | null" }),
+      type({
+        path: plainPath,
+        "startLine?": positiveInteger(Number.MAX_SAFE_INTEGER),
+        "endLine?": positiveInteger(Number.MAX_SAFE_INTEGER),
+      }).onDeepUndeclaredKey("reject"),
       ["path", "startLine", "endLine"],
       async (args) => {
         const target = resolve(string(args.path, "path"));
@@ -236,7 +254,11 @@ export async function createWorkerTools(input: {
     tool(
       "conduct_glob",
       "Match a relative glob against safely enumerated snapshot files. Hidden files included; ignores are not consulted. Maximum 1000 results. Null optional fields use defaults.",
-      type({ pattern: "string", "path?": "string | null", "limit?": "number | null" }),
+      type({
+        pattern: type("string").atLeastLength(1),
+        "path?": plainPath.or("null"),
+        "limit?": positiveInteger(1000),
+      }).onDeepUndeclaredKey("reject"),
       ["pattern", "path", "limit"],
       async (args) => {
         const pattern = string(args.pattern, "pattern");
@@ -266,10 +288,10 @@ export async function createWorkerTools(input: {
       "Search safely enumerated plain files with native regex matching. Hidden files included; ignores are not consulted. Maximum 1000 matches; files above 4 MiB, invalid UTF-8 and binary files skipped. Null optional fields use defaults.",
       type({
         pattern: "string",
-        "path?": "string | null",
+        "path?": plainPath.or("null"),
         "ignoreCase?": "boolean | null",
-        "limit?": "number | null",
-      }),
+        "limit?": positiveInteger(1000),
+      }).onDeepUndeclaredKey("reject"),
       ["pattern", "path", "ignoreCase", "limit"],
       async (args, signal) => {
         const pattern = string(args.pattern, "pattern");
@@ -300,13 +322,14 @@ export async function createWorkerTools(input: {
     tool(
       "conduct_edit",
       "Apply a nonempty batch of native exact string replacements. edits: [{path, old_string, new_string, replace_all?}]. Each file appears once. No fuzzy matching, freeform grammar, rename, delete, repair or fallback execution. Every target is preflighted and all replacements staged before writes.",
-      type({ edits: editEntry.array() }),
+      type({ edits: editEntry.array().atLeastLength(1) }).onDeepUndeclaredKey("reject"),
       ["edits"],
       async (args, signal) => {
         if (!Array.isArray(args.edits) || args.edits.length === 0)
           throw new Error("edits must be a nonempty array");
         const seen = new Set<string>();
         const edits = [];
+        const original = new Map<string, Buffer | undefined>();
         for (const raw of args.edits) {
           const edit = record(raw, ["path", "old_string", "new_string", "replace_all"]);
           const target = await writable(string(edit.path, "path"));
@@ -317,9 +340,12 @@ export async function createWorkerTools(input: {
           if (old_string.includes("\0") || new_string.includes("\0"))
             throw new Error("NUL-containing edits are unsupported");
           try {
-            decodeText(await fs.readFile(target));
+            const bytes = await fs.readFile(target);
+            decodeText(bytes);
+            original.set(target, bytes);
           } catch (error) {
             if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+            original.set(target, undefined);
           }
           edits.push({
             path: target,
@@ -328,7 +354,7 @@ export async function createWorkerTools(input: {
             replace_all: boolean(edit.replace_all),
           });
         }
-        const staged = new Map<string, string>();
+        const staged = new Map<string, Buffer>();
         const reports: string[] = [];
         for (const edit of edits) {
           const json = JSON.stringify(edit);
@@ -363,7 +389,8 @@ export async function createWorkerTools(input: {
               )
                 throw new Error("Unsupported native mutation request");
               await writable(request.path);
-              staged.set(request.path, request.content);
+              const bytes = Buffer.from(request.content, "utf8");
+              if (!original.get(request.path)?.equals(bytes)) staged.set(request.path, bytes);
               return { written: request.content };
             });
             if (result.isError) throw new Error(result.text);
@@ -376,24 +403,45 @@ export async function createWorkerTools(input: {
         // Repeat the whole batch preflight before the first actual mutation.
         for (const target of staged.keys()) await writable(target);
         for (const [target, content] of staged) {
+          signal?.throwIfAborted();
           await fs.mkdir(path.dirname(target), { recursive: true });
-          await fs.writeFile(target, content, "utf8");
+          signal?.throwIfAborted();
+          await fs.writeFile(target, content);
         }
-        return text(reports.join("\n"));
+        return {
+          ...text(staged.size ? reports.join("\n") : "No change: staged edits leave all bytes unchanged."),
+          details: { changed: staged.size > 0 },
+        };
       },
     ),
     tool(
       "conduct_write",
       "Write plain UTF-8 content to one exact allowed regular-file or absent target. No device, archive, database, LSP or formatter routing.",
-      type({ path: "string", content: "string" }),
+      type({ path: plainPath, content: "string" }).onDeepUndeclaredKey("reject"),
       ["path", "content"],
-      async (args) => {
+      async (args, signal) => {
         const target = await writable(string(args.path, "path"));
         const content = string(args.content, "content");
         if (content.includes("\0")) throw new Error("NUL-containing writes are unsupported");
-        await fs.mkdir(path.dirname(target), { recursive: true });
-        await fs.writeFile(target, content, "utf8");
-        return text(`Wrote ${path.relative(cwd, target)}`);
+        const bytes = Buffer.from(content, "utf8");
+        let existing: Buffer | undefined;
+        try {
+          existing = await fs.readFile(target);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        }
+        const changed = !existing?.equals(bytes);
+        if (changed) {
+          await writable(target);
+          signal?.throwIfAborted();
+          await fs.mkdir(path.dirname(target), { recursive: true });
+          signal?.throwIfAborted();
+          await fs.writeFile(target, bytes);
+        }
+        return {
+          ...text(`${changed ? "Wrote" : "No change:"} ${path.relative(cwd, target)} (${bytes.length} UTF-8 bytes)`),
+          details: { changed },
+        };
       },
     ),
   ];

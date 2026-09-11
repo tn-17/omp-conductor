@@ -416,6 +416,212 @@ test.each(["off", "on", "rebuilt", "error"])("worker and advisor policy: %s", as
   }
 });
 
+test.each(["empty", "reset", "malformed", "malformed-queued", "queued", "bridge", "cancel"])(
+  "worker mutation progress guard: %s",
+  async (mode) => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "conduct-worker-progress-"));
+    const { session, registry } = await openTestSession(directory);
+    const controller = new AbortController();
+    const cleanupEntered = Promise.withResolvers<void>();
+    const cleanupRelease = Promise.withResolvers<void>();
+    let child: sdk.AgentSession | undefined;
+    let childId: string | undefined;
+    let requests = 0;
+    const results: Array<{ name: string; isError: boolean; changed?: boolean }> = [];
+    const call = (name: string, args: Record<string, unknown>) => ({
+      type: "toolCall" as const,
+      id: `call-${Bun.randomUUIDv7()}`,
+      name,
+      arguments: args,
+    });
+    const write = (content: string) => call("conduct_write", { path: "candidate.txt", content });
+    const read = () => call("conduct_read", { path: "candidate.txt" });
+    const malformed = () => call("conduct_edit", { edits: "not an array" });
+    const finish = () => call("yield", { data: { finished: true } });
+    const turns =
+      mode === "reset"
+        ? [[write("a")], [write("a")], [malformed()], [write("b")], [read()],
+            [write("b")], [write("b")], [write("c")], [finish()]]
+        : mode === "malformed-queued"
+          ? [[malformed(), malformed(), malformed(), write("escaped")]]
+        : mode === "malformed"
+          ? [[malformed()], [read()], [malformed()], [read()], [malformed()], [write("escaped")]]
+          : mode === "queued"
+            ? [[write(""), write(""), write(""), write(""), write("escaped")]]
+            : [[write("")], [write("")], [read()], [write("")], [read()],
+                [write("")], [write("escaped")]];
+    const intercept = spyOn(sdk, "runSubprocess").mockImplementation(async (input) => {
+      const created = await sdk.createAgentSession({
+        cwd: directory,
+        agentDir: directory,
+        modelRegistry: registry,
+        model: registry.find("cleanup-test", "worker")!,
+        settings: input.settings,
+        sessionManager: sdk.SessionManager.inMemory(directory),
+        toolNames: input.agent.tools,
+        requireYieldTool: true,
+        customTools: input.customTools,
+        preloadedPreparedExtensions: input.preloadedPreparedExtensions,
+        preloadedCustomToolPaths: [],
+        extensions: [() => {}],
+        disableExtensionDiscovery: true,
+        contextFiles: [],
+        skills: [],
+        rules: [],
+        promptTemplates: [],
+        slashCommands: [],
+        enableMCP: false,
+        enableLsp: false,
+        skipPythonPreflight: true,
+      });
+      child = created.session;
+      childId = input.id;
+      sdk.AgentRegistry.global().register({
+        id: input.id,
+        displayName: "Conduct worker",
+        kind: "sub",
+        session: child,
+      });
+      await initializeExtensions(child, {
+        mode: "print",
+        reportSendError: (error) => { throw error; },
+        reportRuntimeError: (error) => { throw error; },
+      });
+      child.subscribe((event) => {
+        if (event.type !== "tool_execution_end") return;
+        results.push({
+          name: event.toolName,
+          isError: event.isError === true,
+          changed: event.result.details?.changed,
+        });
+        if (mode === "cancel" && results.length === 2) controller.abort();
+      });
+      child.agent.streamFn = (model) => {
+        input.signal?.throwIfAborted();
+        const stream = createAssistantMessageEventStream();
+        const content = turns[requests++] ?? [finish()];
+        const message: AssistantMessage = {
+          role: "assistant",
+          api: model.api,
+          provider: model.provider,
+          model: model.id,
+          content,
+          stopReason: "toolUse",
+          usage: {
+            input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+          },
+          timestamp: Date.now(),
+        };
+        stream.push({ type: "done", reason: "toolUse", message });
+        stream.end(message);
+        return stream;
+      };
+      const abort = () => child!.agent.abort();
+      input.signal?.addEventListener("abort", abort, { once: true });
+      try {
+        if (mode === "bridge") {
+          await child.extensionRunner!.emitBeforeAgentStart(input.task, undefined, ["Worker"]);
+          const tool = child.getToolByName("conduct_write")!;
+          // Provider bridges call the extension-wrapped tool directly, without
+          // the primary agent loop's execution-end event.
+          const outputs = await Promise.all(
+            ["", "", "", "", "escaped"].map((content) =>
+              tool.execute("reused-bridge-id", { path: "candidate.txt", content })
+                .catch(() => ({ isError: true, details: undefined })),
+            ),
+          );
+          expect(outputs.slice(0, 4).map((result) => result.details?.changed)).toEqual([
+            true, false, false, false,
+          ]);
+          expect(outputs[4].isError).toBe(true);
+        } else {
+          await child.extensionRunner!.emitBeforeAgentStart(input.task, undefined, ["Worker"]);
+          // Drive the core loop directly: the real executor owns cancellation
+          // and deferred session recovery; this fixture owns only core cleanup.
+          await child.agent.prompt(input.task);
+        }
+      } catch (error) {
+        if (!input.signal?.aborted) throw error;
+      } finally {
+        input.signal?.removeEventListener("abort", abort);
+      }
+      input.onCleanupDeferred?.(cleanupRelease.promise);
+      cleanupEntered.resolve();
+      return {
+        id: input.id, index: 0, agent: "conduct-worker", agentSource: "project",
+        task: input.task, exitCode: input.signal?.aborted ? 1 : 0,
+        aborted: input.signal?.aborted, output: "", stderr: "", truncated: false,
+        durationMs: 0, tokens: 0, requests,
+      } satisfies sdk.SingleResult;
+    });
+    let execution: Promise<sdk.SingleResult> | undefined;
+    try {
+      await initializeExtensions(session, {
+        mode: "print",
+        reportSendError: (error) => { throw error; },
+        reportRuntimeError: (error) => { throw error; },
+      });
+      execution = runWorker({
+        ctx: session.extensionRunner!.createContext(),
+        model: registry.find("cleanup-test", "worker")!,
+        directive: "Write candidate.txt.",
+        assignment: "Only candidate.txt.",
+        brief: {
+          context: "Saved file", fixedDecisions: [], acceptance: ["Write candidate"],
+          model: "cleanup-test/worker",
+        },
+        root: directory, files: ["candidate.txt"], worktree: directory,
+        signal: controller.signal, onProgress: () => {},
+      });
+      let settled = false;
+      void execution.then(() => { settled = true; }, () => { settled = true; });
+      await Promise.race([
+        cleanupEntered.promise,
+        execution.then(() => {
+          throw new Error("Worker settled before registering deferred cleanup");
+        }),
+      ]);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(settled).toBe(false);
+      cleanupRelease.resolve();
+      if (mode === "reset") {
+        expect((await execution).exitCode).toBe(0);
+        expect(await fs.readFile(path.join(directory, "candidate.txt"), "utf8")).toBe("c");
+        expect(results.filter((result) => result.changed === true)).toHaveLength(3);
+        expect(results.some((result) => result.name === "conduct_edit" && result.isError)).toBe(true);
+      } else if (mode === "cancel") {
+        expect((await execution).aborted).toBe(true);
+        expect(requests).toBe(2);
+        expect(await fs.readFile(path.join(directory, "candidate.txt"), "utf8")).toBe("");
+      } else {
+        await expect(execution).rejects.toThrow("Conduct worker: stopped after three");
+        if (mode === "malformed" || mode === "malformed-queued") {
+          expect(results.filter((result) => result.name === "conduct_edit" && result.isError))
+            .toHaveLength(3);
+          expect(requests).toBe(mode === "malformed" ? 5 : 1);
+          expect(await fs.lstat(path.join(directory, "candidate.txt")).catch(() => null)).toBeNull();
+        } else {
+          expect(await fs.readFile(path.join(directory, "candidate.txt"), "utf8")).toBe("");
+          if (mode !== "bridge") {
+            expect(results.filter((result) => result.changed === true)).toHaveLength(1);
+            expect(results.filter((result) => result.changed === false)).toHaveLength(3);
+            expect(requests).toBe(mode === "queued" ? 1 : 6);
+          }
+        }
+      }
+    } finally {
+      cleanupRelease.resolve();
+      await execution?.catch(() => {});
+      intercept.mockRestore();
+      await child?.dispose();
+      if (childId) sdk.AgentRegistry.global().unregister(childId);
+      await session.dispose();
+      await fs.rm(directory, { recursive: true, force: true });
+    }
+  },
+);
+
 test("an explicitly requested advisor cannot silently become an unadvised successful worker", async () => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "conduct-advisor-setup-"));
   const { session, registry } = await openTestSession(directory);
