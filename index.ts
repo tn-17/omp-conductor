@@ -203,7 +203,7 @@ export default function conductExtension(pi: ExtensionAPI): void {
     ctx.ui.setStatus(
       "conductor",
       state.enabled
-        ? `Conduct: on | workers ${state.workers} | advisor ${state.advisorModel ?? "off"} | requested fast worker ${state.workerFast === true ? "on" : "off"}, advisor ${state.advisorFast === true ? "on" : "off"} | ${reviewStatus()}${running ? (running.phase === "worker" ? ` | ${stageStatus()}` : " | capturing candidates") : ""}`
+        ? `Conductor: on | workers ${state.workers} | advisor ${state.advisorModel ?? "off"} | requested fast worker ${state.workerFast === true ? "on" : "off"}, advisor ${state.advisorFast === true ? "on" : "off"} | ${reviewStatus()}${running ? (running.phase === "worker" ? ` | ${stageStatus()}` : " | capturing candidates") : ""}`
         : undefined,
     );
   }

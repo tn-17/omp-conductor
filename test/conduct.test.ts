@@ -148,7 +148,7 @@ test("uses the conductor key for the OMP status line", async () => {
 
   await runner.getCommand("conductor")!.handler("on", commandContext);
 
-  expect(statuses).toContainEqual(["conductor", expect.any(String)]);
+  expect(statuses).toContainEqual(["conductor", expect.stringMatching(/^Conductor: on \|/)]);
 });
 
 test("verification configuration preserves exact quoted argv and rejects malformed input", async () => {
