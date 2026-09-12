@@ -339,6 +339,38 @@ test("cancelled correction retains the preceding review and verification evidenc
   expect(saved.review?.passes[1]?.error).toContain("cancelled");
 });
 
+test("thrown correction failure is recorded on an explicit correction pass", async () => {
+  const { input, root } = await fixture();
+  input.assignments = input.assignments.slice(0, 1);
+  let calls = 0;
+  const worker = spyOn(workers, "runWorker").mockImplementation(async (request) => {
+    if (++calls === 2) throw new Error("correction invocation failed");
+    await Bun.write(path.join(request.root, "a.ts"), "export const a = 2;\n");
+    return result();
+  });
+  const reviewer = spyOn(reviewers, "runReviewer").mockImplementation(async () => ({
+    result: result(),
+    report: { summary: "Needs correction", findings: [finding] },
+  }));
+  restores.push(
+    () => worker.mockRestore(),
+    () => reviewer.mockRestore(),
+  );
+  const [entry] = await runAssignments({
+    ...input,
+    reviewerModel: "batch-test/worker",
+    reviewPasses: 2,
+  });
+  expect(entry!.details.status).toBe("failed");
+  const saved = await candidates.load(input.storeDir, root, entry!.details.candidate.id);
+  expect(saved.review?.status).toBe("failed");
+  expect(saved.review?.passes.map((pass) => pass.pass)).toEqual([1, 2]);
+  expect(saved.review?.passes[0]?.review?.findings[0]?.id).toBe("wrong-value");
+  expect(saved.review?.passes[0]?.error).toBeUndefined();
+  expect(saved.review?.passes[1]?.review).toBeUndefined();
+  expect(saved.review?.passes[1]?.error).toContain("correction invocation failed");
+});
+
 test("read-only reviewer mutation fails even inside the writable candidate scope", async () => {
   const { input } = await fixture();
   input.assignments = input.assignments.slice(0, 1);

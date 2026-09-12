@@ -51,7 +51,6 @@ export interface CandidateRecord {
   review?: ReviewHistory;
   changes: string[];
   patchPath: string;
-  reviewToken?: string;
   error?: string;
   worker?: { status: string; model?: string; id?: string; outputPath?: string };
   baseline: Record<string, FileState>;
@@ -218,7 +217,8 @@ export async function load(store: string, cwd: string, id: string): Promise<Cand
   const directory = location(store, id);
   const record = JSON.parse(
     await fs.readFile(path.join(directory, "record.json"), "utf8"),
-  ) as CandidateRecord;
+  ) as CandidateRecord & { reviewToken?: string };
+  delete record.reviewToken;
   if (
     record.version !== 1 ||
     record.id !== id ||
@@ -439,8 +439,7 @@ async function delta(
   return { patch, changes };
 }
 function token(record: CandidateRecord, patch: Buffer): string {
-  const { reviewToken: _, ...bound } = record;
-  const canonical = JSON.stringify(bound, (_key, value) => {
+  const canonical = JSON.stringify(record, (_key, value) => {
     if (value && typeof value === "object" && !Array.isArray(value))
       return Object.fromEntries(
         Object.keys(value)
@@ -869,7 +868,6 @@ export async function rejectCandidate(
     if (record.status === "running" || record.status === "applying" || record.status === "applied")
       throw new Error(`Cannot reject a ${record.status} candidate`);
     record.status = "rejected";
-    delete record.reviewToken;
     await save(storeDir, record);
     return record;
   });
@@ -882,7 +880,6 @@ export async function recoverCandidates(storeDir: string, cwd: string): Promise<
       record.error = interruptedApply
         ? "Application interrupted; working files may be partially changed. Inspect them manually; this candidate cannot be reapplied."
         : "Worker interrupted by session restart; retained candidate is not applicable.";
-      delete record.reviewToken;
       await save(storeDir, record);
       // An orphan snapshot is retained for manual recovery, never redispatched.
     }

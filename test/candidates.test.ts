@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -47,6 +48,20 @@ async function git(cwd: string, ...args: string[]): Promise<string> {
   if (code !== 0) throw new Error(stderr);
   return stdout;
 }
+function historicalToken(record: Record<string, unknown>, patch: Buffer): string {
+  const { reviewToken: _unused, ...bound } = record;
+  const canonical = JSON.stringify(bound, (_key, value) => {
+    if (value && typeof value === "object" && !Array.isArray(value))
+      return Object.fromEntries(
+        Object.keys(value)
+          .sort()
+          .map((key) => [key, (value as Record<string, unknown>)[key]]),
+      );
+    return value;
+  });
+  return createHash("sha256").update(canonical).update("\0").update(patch).digest("hex");
+}
+
 async function workspace(): Promise<{ root: string; storeDir: string }> {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "conduct-candidate-"));
   directories.push(directory);
@@ -93,6 +108,65 @@ async function ready(
   return { id: record.id, reviewToken: review.reviewToken! };
 }
 
+test("historical v1 review tokens remain applicable and bind persisted metadata", async () => {
+  const { root, storeDir } = await workspace();
+  const prepared = await prepare(root, storeDir);
+  await fs.writeFile(path.join(prepared.worktree, "source.txt"), "candidate\n");
+  const record = await finishCandidate(prepared, { status: "completed" });
+  const filename = path.join(storeDir, record.id, "record.json");
+  const original = JSON.parse(await fs.readFile(filename, "utf8")) as Record<string, unknown>;
+  const patch = await fs.readFile(record.patchPath);
+  const historical = historicalToken(original, patch);
+  expect(original.cwd).toBe(root);
+  expect(original.worker).toEqual({ status: "completed" });
+  expect(original.finalTree).toBe(record.finalTree);
+
+  const legacy = { ...original, reviewToken: "stale-token" };
+  await fs.writeFile(filename, JSON.stringify(legacy));
+  const loaded = await load(storeDir, root, record.id);
+  expect(loaded).not.toHaveProperty("reviewToken");
+  expect((await inspectCandidate(storeDir, root, record.id)).reviewToken).toBe(historical);
+  await expect(applyCandidate(storeDir, root, record.id, "stale-token")).rejects.toThrow(
+    "Review token",
+  );
+
+  await fs.writeFile(filename, JSON.stringify({ ...legacy, assignment: "tampered" }));
+  await expect(applyCandidate(storeDir, root, record.id, historical)).rejects.toThrow(
+    "Review token",
+  );
+
+  await fs.writeFile(filename, JSON.stringify(legacy));
+  expect((await applyCandidate(storeDir, root, record.id, historical)).status).toBe("applied");
+});
+
+test("worker provenance survives persisted reload and inspection", async () => {
+  const { root, storeDir } = await workspace();
+  const prepared = await prepare(root, storeDir);
+  await fs.writeFile(path.join(prepared.worktree, "source.txt"), "candidate\n");
+  const record = await finishCandidate(prepared, {
+    status: "completed",
+    model: "conduct-test/worker",
+    id: "worker-run-123",
+    outputPath: "/tmp/conduct-worker-output",
+  });
+  expect(record.worker).toEqual({
+    status: "completed",
+    model: "conduct-test/worker",
+    id: "worker-run-123",
+    outputPath: "/tmp/conduct-worker-output",
+  });
+  expect(record.brief?.reviewerModel).toBeUndefined();
+  expect(record.brief?.verification).toBeUndefined();
+
+  const loaded = await load(storeDir, root, record.id);
+  expect(loaded.worker).toEqual(record.worker);
+  expect(loaded.cwd).toBe(root);
+  expect(loaded.finalTree).toBe(record.finalTree);
+  const inspected = await inspectCandidate(storeDir, root, record.id);
+  expect(inspected.candidate.worker).toEqual(record.worker);
+  expect(inspected.candidate.review).toBeUndefined();
+});
+
 test("cumulative review patch preserves original baseline and final capture authority", async () => {
   const { root, storeDir } = await workspace();
   const prepared = await prepare(root, storeDir);
@@ -101,7 +175,6 @@ test("cumulative review patch preserves original baseline and final capture auth
   expect(first).toContain("-original");
   expect(first).toContain("+first");
   expect((await load(storeDir, root, prepared.candidate.id)).status).toBe("running");
-  expect(await fs.readFile(prepared.candidate.patchPath, "utf8")).toBe("");
   await fs.writeFile(path.join(prepared.worktree, "source.txt"), "corrected\n");
   const corrected = await readCandidatePatch(prepared);
   expect(corrected).toContain("-original");

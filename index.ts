@@ -8,6 +8,7 @@ import {
   applyCandidate,
   rejectCandidate,
   recoverCandidates,
+  type CandidateRecord,
 } from "./candidates";
 import candidateDescription from "./prompts/candidate.md" with { type: "text" };
 import candidateViewTemplate from "./prompts/candidate-view.md" with { type: "text" };
@@ -16,7 +17,7 @@ import conductOff from "./prompts/off.md" with { type: "text" };
 import taskDescription from "./prompts/task.md" with { type: "text" };
 import selectDescription from "./prompts/select.md" with { type: "text" };
 import selectionTemplate from "./prompts/selection.md" with { type: "text" };
-import { readMarkerFile, selectMarker, type MarkerSelection } from "./selection";
+import { readMarkerFile, selectMarker, type MarkerFile, type MarkerSelection } from "./selection";
 import { resolveAdvisorModel, resolveLocalModel } from "./worker";
 import { resolveReviewerModel } from "./reviewer";
 import { parseVerificationArgs, validateVerification } from "./verification";
@@ -27,6 +28,62 @@ import { runAssignments, type ConductAssignment, type AssignmentResult } from ".
 const renderCandidateView = prompt.compile(candidateViewTemplate);
 const renderSelection = prompt.compile(selectionTemplate);
 
+function renderCandidateText(
+  candidate: CandidateRecord,
+  patch: string,
+  reviewToken: string | undefined,
+): string {
+  return renderCandidateView({
+    ...candidate,
+    verificationCommand: candidate.brief?.verification
+      ? JSON.stringify(candidate.brief.verification.argv)
+      : undefined,
+    reviewLines: candidate.review
+      ? JSON.stringify(candidate.review, null, 2).split("\n")
+      : undefined,
+    patchLines: patch.split(/\r?\n/),
+    approval: reviewToken ? `/conductor apply ${candidate.id} ${reviewToken}` : "Not applicable.",
+  });
+}
+
+function renderSelectionText(selection: MarkerSelection): string {
+  return renderSelection({
+    ...selection,
+    selection: selection.id,
+    directiveLines: selection.directive.split(/\r?\n/),
+  });
+}
+
+function candidateListText(candidates: CandidateRecord[]): string {
+  return (
+    candidates
+      .map((candidate) => `${candidate.id}: ${candidate.status} (${candidate.files.join(", ")})`)
+      .join("\n") || "No candidates."
+  );
+}
+
+function markerListText(file: MarkerFile): string {
+  return file.regions.length
+    ? file.regions
+        .map(
+          (region) =>
+            `${region.name ?? "(unnamed)"} @${region.startLine} (${region.startLine}-${region.endLine})`,
+        )
+        .join("\n")
+    : `No OMP-CONDUCT directives in ${file.path}.`;
+}
+
+function selectionDetails(selection: MarkerSelection, includeDirective = false) {
+  return {
+    selection: selection.id,
+    path: selection.path,
+    marker: selection.name,
+    startLine: selection.startLine,
+    endLine: selection.endLine,
+    ...(includeDirective ? { directive: selection.directive } : {}),
+  };
+}
+
 const STATE_ENTRY = "conduct-state";
 const TOOL = "conduct_task";
 const BATCH_TOOL = "conduct_batch";
@@ -34,6 +91,10 @@ const SELECT_TOOL = "conduct_select";
 const CANDIDATE_TOOL = "conduct_candidate";
 const USAGE =
   '/conductor on | off [cancel] | status | workers [1..8] | model [provider/id] | advisor [off|provider/model-id] | reviewer [off|provider/model-id] | review-passes [1..10] | verify [off|command args...] | fast [worker|advisor|reviewer [on|off]] | cancel | markers "file" | select "file" [name|@line] | candidates | review id | apply id reviewToken | reject id';
+const TASK_TOOL_DESCRIPTION =
+  "Dispatch one bounded Conduct assignment. Conduct must be enabled and the user must explicitly request implementation. Supply exactly one of directive or selection, plus nonempty exact writable files (cwd-relative or absolute inside the Git repository; no directories or globs), assignment, context, fixedDecisions, and acceptance; inspect the retained candidate and use the explicit human apply command. The enabled system prompt contains the canonical handoff and safety policy.";
+const BATCH_TOOL_DESCRIPTION =
+  "Run an ordered `tasks` array of 1–8 independent Conduct assignments concurrently, bounded by the human-configured worker limit; each task uses the conduct_task schema, nonempty exact file ownership is disjoint (including ancestor paths), and one failure does not cancel siblings. No queue, dependencies, background work, or automatic application. Conduct returns unapplied candidates; review and explicitly apply each one. The enabled system prompt contains the canonical handoff and safety policy.";
 
 interface ConductState {
   version: 1;
@@ -41,13 +102,23 @@ interface ConductState {
   workers: number;
   model?: string;
   advisorModel?: string;
-  workerFast?: boolean;
-  advisorFast?: boolean;
+  workerFast: boolean;
+  advisorFast: boolean;
   reviewerModel?: string;
-  reviewerFast?: boolean;
-  reviewPasses?: number;
+  reviewerFast: boolean;
+  reviewPasses: number;
   verification?: VerificationConfig;
 }
+
+const DEFAULT_STATE: ConductState = {
+  version: 1,
+  enabled: false,
+  workers: 1,
+  workerFast: false,
+  advisorFast: false,
+  reviewerFast: false,
+  reviewPasses: 3,
+};
 
 interface ActiveRun {
   phase: "worker" | "capture";
@@ -127,38 +198,30 @@ function parseState(data: unknown): ConductState | undefined {
       return;
     }
   }
-  return {
-    version: 1,
-    enabled: data.enabled,
-    reviewerModel:
-      "reviewerModel" in data && typeof data.reviewerModel === "string"
-        ? data.reviewerModel
-        : undefined,
-    reviewerFast: "reviewerFast" in data && data.reviewerFast === true,
-    reviewPasses:
-      "reviewPasses" in data && typeof data.reviewPasses === "number" ? data.reviewPasses : 3,
-    verification,
-    workers: "workers" in data && typeof data.workers === "number" ? data.workers : 1,
-    workerFast: "workerFast" in data && data.workerFast === true,
-    advisorFast: "advisorFast" in data && data.advisorFast === true,
-    model: "model" in data && typeof data.model === "string" ? data.model : undefined,
-    advisorModel:
-      "advisorModel" in data && typeof data.advisorModel === "string"
-        ? data.advisorModel
-        : undefined,
-  };
+  const normalized: ConductState = { ...DEFAULT_STATE };
+  normalized.enabled = data.enabled;
+  normalized.reviewerModel =
+    "reviewerModel" in data && typeof data.reviewerModel === "string"
+      ? data.reviewerModel
+      : undefined;
+  normalized.reviewerFast = "reviewerFast" in data && data.reviewerFast === true;
+  normalized.reviewPasses =
+    "reviewPasses" in data && typeof data.reviewPasses === "number"
+      ? data.reviewPasses
+      : DEFAULT_STATE.reviewPasses;
+  normalized.verification = verification;
+  normalized.workers =
+    "workers" in data && typeof data.workers === "number" ? data.workers : DEFAULT_STATE.workers;
+  normalized.workerFast = "workerFast" in data && data.workerFast === true;
+  normalized.advisorFast = "advisorFast" in data && data.advisorFast === true;
+  normalized.model = "model" in data && typeof data.model === "string" ? data.model : undefined;
+  normalized.advisorModel =
+    "advisorModel" in data && typeof data.advisorModel === "string" ? data.advisorModel : undefined;
+  return normalized;
 }
 
 export default function conductExtension(pi: ExtensionAPI): void {
-  let state: ConductState = {
-    version: 1,
-    enabled: false,
-    workers: 1,
-    workerFast: false,
-    advisorFast: false,
-    reviewerFast: false,
-    reviewPasses: 3,
-  };
+  let state: ConductState = { ...DEFAULT_STATE };
   let hasState = false;
   let running: ActiveRun | undefined;
   let selected: MarkerSelection | undefined;
@@ -190,7 +253,7 @@ export default function conductExtension(pi: ExtensionAPI): void {
   }
 
   function reviewStatus(): string {
-    return `reviewer ${state.reviewerModel ?? "off"} | reviewer fast ${state.reviewerFast === true ? "on" : "off"} | reviews ${state.reviewPasses ?? 3} | verify ${state.verification ? `${JSON.stringify(state.verification.argv)} (120000ms, trusted host)` : "off"}`;
+    return `reviewer ${state.reviewerModel ?? "off"} | reviewer fast ${state.reviewerFast ? "on" : "off"} | reviews ${state.reviewPasses} | verify ${state.verification ? `${JSON.stringify(state.verification.argv)} (120000ms, trusted host)` : "off"}`;
   }
 
   function stageStatus(): string {
@@ -203,7 +266,7 @@ export default function conductExtension(pi: ExtensionAPI): void {
     ctx.ui.setStatus(
       "conductor",
       state.enabled
-        ? `Conductor: on | workers ${state.workers} | advisor ${state.advisorModel ?? "off"} | requested fast worker ${state.workerFast === true ? "on" : "off"}, advisor ${state.advisorFast === true ? "on" : "off"} | ${reviewStatus()}${running ? (running.phase === "worker" ? ` | ${stageStatus()}` : " | capturing candidates") : ""}`
+        ? `Conductor: on | workers ${state.workers} | advisor ${state.advisorModel ?? "off"} | requested fast worker ${state.workerFast ? "on" : "off"}, advisor ${state.advisorFast ? "on" : "off"} | ${reviewStatus()}${running ? (running.phase === "worker" ? ` | ${stageStatus()}` : " | capturing candidates") : ""}`
         : undefined,
     );
   }
@@ -231,15 +294,7 @@ export default function conductExtension(pi: ExtensionAPI): void {
     selectionEpoch++;
     selected = undefined;
     selections.clear();
-    state = {
-      version: 1,
-      enabled: false,
-      workers: 1,
-      workerFast: false,
-      advisorFast: false,
-      reviewerFast: false,
-      reviewPasses: 3,
-    };
+    state = { ...DEFAULT_STATE };
     hasState = false;
     for (const entry of ctx.sessionManager.getBranch()) {
       if (entry.type !== "custom" || entry.customType !== STATE_ENTRY) continue;
@@ -388,30 +443,14 @@ export default function conductExtension(pi: ExtensionAPI): void {
             if (action === "candidates") {
               const candidates = await listCandidates(store(ctx), ctx.cwd);
               assertEpoch(epoch);
-              ctx.ui.notify(
-                candidates.map((c) => `${c.id}: ${c.status} (${c.files.join(", ")})`).join("\n") ||
-                  "No candidates.",
-                "info",
-              );
+              ctx.ui.notify(candidateListText(candidates), "info");
             } else if (action === "review") {
               const view = await inspectCandidate(store(ctx), ctx.cwd, rest[0]);
               assertEpoch(epoch);
               pi.sendMessage(
                 {
                   customType: "conduct-candidate",
-                  content: renderCandidateView({
-                    ...view.candidate,
-                    verificationCommand: view.candidate.brief?.verification
-                      ? JSON.stringify(view.candidate.brief.verification.argv)
-                      : undefined,
-                    reviewLines: view.candidate.review
-                      ? JSON.stringify(view.candidate.review, null, 2).split("\n")
-                      : undefined,
-                    patchLines: view.patch.split(/\r?\n/),
-                    approval: view.reviewToken
-                      ? `/conductor apply ${view.candidate.id} ${view.reviewToken}`
-                      : "Not applicable.",
-                  }),
+                  content: renderCandidateText(view.candidate, view.patch, view.reviewToken),
                   display: true,
                   details: view,
                 },
@@ -430,7 +469,7 @@ export default function conductExtension(pi: ExtensionAPI): void {
           case "status":
             if (rest.length) throw new Error(USAGE);
             ctx.ui.notify(
-              `Conduct ${state.enabled ? "on" : "off"}. Worker: ${state.model ?? "not selected"}. Worker limit: ${state.workers}. Advisor: ${state.advisorModel ?? "off"}. Requested fast: worker ${state.workerFast === true ? "on" : "off"}; advisor ${state.advisorFast === true ? "on" : "off"}. ${reviewStatus()}. ${running ? `${stageStatus()}.` : "Idle."} ${selected ? `Selected: ${selected.path}:${selected.startLine}-${selected.endLine}.` : "No marker selected."} Protected unapplied candidates; explicit human application; no OS sandbox.`,
+              `Conduct ${state.enabled ? "on" : "off"}. Worker: ${state.model ?? "not selected"}. Worker limit: ${state.workers}. Advisor: ${state.advisorModel ?? "off"}. Requested fast: worker ${state.workerFast ? "on" : "off"}; advisor ${state.advisorFast ? "on" : "off"}. ${reviewStatus()}. ${running ? `${stageStatus()}.` : "Idle."} ${selected ? `Selected: ${selected.path}:${selected.startLine}-${selected.endLine}.` : "No marker selected."} Protected unapplied candidates; explicit human application; no OS sandbox.`,
               "info",
             );
             return;
@@ -446,17 +485,7 @@ export default function conductExtension(pi: ExtensionAPI): void {
             if (selectionVersion !== selectionEpoch)
               throw new Error("Selection was superseded; select again.");
             if (action === "markers") {
-              ctx.ui.notify(
-                file.regions.length
-                  ? file.regions
-                      .map(
-                        (region) =>
-                          `${region.name ?? "(unnamed)"} @${region.startLine} (${region.startLine}-${region.endLine})`,
-                      )
-                      .join("\n")
-                  : `No OMP-CONDUCT directives in ${file.path}.`,
-                "info",
-              );
+              ctx.ui.notify(markerListText(file), "info");
               return;
             }
             const selector = rest[1];
@@ -475,19 +504,9 @@ export default function conductExtension(pi: ExtensionAPI): void {
             pi.sendMessage(
               {
                 customType: "conduct-selection",
-                content: renderSelection({
-                  ...selected,
-                  selection: selected.id,
-                  directiveLines: selected.directive.split(/\r?\n/),
-                }),
+                content: renderSelectionText(selected),
                 display: true,
-                details: {
-                  selection: selected.id,
-                  path: selected.path,
-                  marker: selected.name,
-                  startLine: selected.startLine,
-                  endLine: selected.endLine,
-                },
+                details: selectionDetails(selected),
               },
               { triggerTurn: false },
             );
@@ -536,8 +555,8 @@ export default function conductExtension(pi: ExtensionAPI): void {
             }
             const report =
               target === undefined
-                ? `worker ${state.workerFast === true ? "on" : "off"}; advisor ${state.advisorFast === true ? "on" : "off"}; reviewer ${state.reviewerFast === true ? "on" : "off"}`
-                : `${target} ${state[target === "worker" ? "workerFast" : target === "advisor" ? "advisorFast" : "reviewerFast"] === true ? "on" : "off"}`;
+                ? `worker ${state.workerFast ? "on" : "off"}; advisor ${state.advisorFast ? "on" : "off"}; reviewer ${state.reviewerFast ? "on" : "off"}`
+                : `${target} ${state[target === "worker" ? "workerFast" : target === "advisor" ? "advisorFast" : "reviewerFast"] ? "on" : "off"}`;
             ctx.ui.notify(
               `Conduct requested fast: ${report}. On requests priority and may cost more; unsupported/local providers may ignore or reject it. Advisor and reviewer fast preferences do not enable those roles.`,
               "info",
@@ -555,7 +574,7 @@ export default function conductExtension(pi: ExtensionAPI): void {
               updateStatus(ctx);
             }
             ctx.ui.notify(
-              `Conduct total reviews: ${state.reviewPasses ?? 3}; at most ${(state.reviewPasses ?? 3) - 1} corrections. Remaining findings or failed verification at the cap require attention, never automatic approval.`,
+              `Conduct total reviews: ${state.reviewPasses}; at most ${state.reviewPasses - 1} corrections. Remaining findings or failed verification at the cap require attention, never automatic approval.`,
               "info",
             );
             return;
@@ -710,7 +729,11 @@ export default function conductExtension(pi: ExtensionAPI): void {
   });
   pi.on("before_agent_start", (event) => {
     if (!hasState) return;
-    return { systemPrompt: [...event.systemPrompt, state.enabled ? conductSkill : conductOff] };
+    return {
+      systemPrompt: state.enabled
+        ? [...event.systemPrompt, conductSkill, taskDescription]
+        : [...event.systemPrompt, conductOff],
+    };
   });
 
   pi.registerTool({
@@ -758,14 +781,7 @@ export default function conductExtension(pi: ExtensionAPI): void {
             content: [
               {
                 type: "text",
-                text: file.regions.length
-                  ? file.regions
-                      .map(
-                        (region) =>
-                          `${region.name ?? "(unnamed)"} @${region.startLine} (${region.startLine}-${region.endLine})`,
-                      )
-                      .join("\n")
-                  : `No OMP-CONDUCT directives in ${file.path}.`,
+                text: markerListText(file),
               },
             ],
             details: { path: file.path, markers: file.regions },
@@ -781,21 +797,10 @@ export default function conductExtension(pi: ExtensionAPI): void {
           content: [
             {
               type: "text",
-              text: renderSelection({
-                ...selected,
-                selection: selected.id,
-                directiveLines: selected.directive.split(/\r?\n/),
-              }),
+              text: renderSelectionText(selected),
             },
           ],
-          details: {
-            selection: selected.id,
-            path: selected.path,
-            marker: selected.name,
-            startLine: selected.startLine,
-            endLine: selected.endLine,
-            directive: selected.directive,
-          },
+          details: selectionDetails(selected, true),
         };
       } finally {
         operation = false;
@@ -830,19 +835,7 @@ export default function conductExtension(pi: ExtensionAPI): void {
             content: [
               {
                 type: "text",
-                text: renderCandidateView({
-                  ...view.candidate,
-                  verificationCommand: view.candidate.brief?.verification
-                    ? JSON.stringify(view.candidate.brief.verification.argv)
-                    : undefined,
-                  reviewLines: view.candidate.review
-                    ? JSON.stringify(view.candidate.review, null, 2).split("\n")
-                    : undefined,
-                  patchLines: view.patch.split(/\r?\n/),
-                  approval: view.reviewToken
-                    ? `/conductor apply ${view.candidate.id} ${view.reviewToken}`
-                    : "Not applicable.",
-                }),
+                text: renderCandidateText(view.candidate, view.patch, view.reviewToken),
               },
             ],
             details: view,
@@ -854,9 +847,7 @@ export default function conductExtension(pi: ExtensionAPI): void {
           content: [
             {
               type: "text",
-              text:
-                candidates.map((c) => `${c.id}: ${c.status} (${c.files.join(", ")})`).join("\n") ||
-                "No candidates.",
+              text: candidateListText(candidates),
             },
           ],
           details: { candidates },
@@ -968,7 +959,7 @@ export default function conductExtension(pi: ExtensionAPI): void {
         advisorFast,
         reviewerModel,
         reviewerFast,
-        reviewPasses: reviewPasses ?? 3,
+        reviewPasses,
         verification,
         signal: runSignal,
         onPrepared: () => {
@@ -991,7 +982,7 @@ export default function conductExtension(pi: ExtensionAPI): void {
             content: [
               {
                 type: "text",
-                text: `Task ${index + 1}/${tasks.length}: ${stage} ${progress.status}; advisor ${advisorModel ?? "off"}; reviewer ${reviewerModel ?? "off"}; requested fast worker ${workerFast === true ? "on" : "off"}, advisor ${advisorFast === true ? "on" : "off"}, reviewer ${reviewerFast === true ? "on" : "off"}; ${progress.toolCount} tool calls${progress.currentTool ? `; ${progress.currentTool}` : ""}.`,
+                text: `Task ${index + 1}/${tasks.length}: ${stage} ${progress.status}; advisor ${advisorModel ?? "off"}; reviewer ${reviewerModel ?? "off"}; requested fast worker ${workerFast ? "on" : "off"}, advisor ${advisorFast ? "on" : "off"}, reviewer ${reviewerFast ? "on" : "off"}; ${progress.toolCount} tool calls${progress.currentTool ? `; ${progress.currentTool}` : ""}.`,
               },
             ],
             details: {
@@ -1000,13 +991,13 @@ export default function conductExtension(pi: ExtensionAPI): void {
               status: progress.status,
               stage,
               reviewerModel,
-              reviewerFast: reviewerFast === true,
-              reviewPasses: reviewPasses ?? 3,
+              reviewerFast,
+              reviewPasses,
               verification,
               model: progress.resolvedModel,
               advisorModel,
-              workerFast: workerFast === true,
-              advisorFast: advisorFast === true,
+              workerFast,
+              advisorFast,
             },
           }),
       });
@@ -1022,7 +1013,7 @@ export default function conductExtension(pi: ExtensionAPI): void {
   pi.registerTool({
     name: TOOL,
     label: "Conduct worker",
-    description: taskDescription,
+    description: TASK_TOOL_DESCRIPTION,
     defaultInactive: true,
     loadMode: "essential",
     approval: "write",
@@ -1036,7 +1027,7 @@ export default function conductExtension(pi: ExtensionAPI): void {
   pi.registerTool({
     name: BATCH_TOOL,
     label: "Conduct worker batch",
-    description: `Run independent Conduct assignments concurrently, returning ordered per-task candidates after all workers and capture finish. Supply tasks using the conduct_task handoff schema. Exact writable ownership must be disjoint, including ancestor paths. The human-configured /conductor workers limit defaults to 1 and cannot exceed 8. No queue, dependencies, automatic apply, or background work. One failed task does not cancel siblings; /conductor cancel cancels all unfinished workers. Review and apply each candidate separately.\n\n${taskDescription}`,
+    description: BATCH_TOOL_DESCRIPTION,
     defaultInactive: true,
     loadMode: "essential",
     approval: "write",

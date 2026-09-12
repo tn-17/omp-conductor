@@ -17,6 +17,7 @@ import * as workers from "../worker";
 import * as candidates from "../candidates";
 import { getAgentDir } from "@oh-my-pi/pi-utils";
 import conductExtension from "../index";
+import taskDescription from "../prompts/task.md" with { type: "text" };
 
 const sessions: AgentSession[] = [];
 const directories: string[] = [];
@@ -29,7 +30,16 @@ afterEach(async () => {
     await fs.rm(directory, { recursive: true, force: true });
 });
 
-async function openSession(manager?: SessionManager, settings?: Settings): Promise<AgentSession> {
+interface SessionOptions {
+  model?: string;
+  toolNames?: string[];
+}
+
+async function openSession(
+  manager?: SessionManager,
+  settings?: Settings,
+  options: SessionOptions = {},
+): Promise<AgentSession> {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "conduct-test-"));
   directories.push(directory);
   const cwd = manager?.getCwd() ?? directory;
@@ -79,11 +89,20 @@ async function openSession(manager?: SessionManager, settings?: Settings): Promi
     apiKey: "test-only",
     models: [model],
   });
+  registry.registerProvider("openai-codex", {
+    baseUrl: "https://example.com/v1",
+    api: "openai-codex-responses",
+    apiKey: "test-only",
+    models: [{ ...model, id: "codex", name: "Codex" }],
+  });
+  const selectedModel = options.model ?? "conduct-test/worker";
+  const [provider, id] = selectedModel.split("/", 2);
+  if (!provider || !id) throw new Error(`Invalid test model selector: ${selectedModel}`);
   const { session } = await createAgentSession({
     cwd,
     agentDir: directory,
     modelRegistry: registry,
-    model: registry.find("conduct-test", "worker"),
+    model: registry.find(provider, id),
     sessionManager: manager ?? SessionManager.create(directory, path.join(directory, "sessions")),
     settings:
       settings ??
@@ -102,7 +121,7 @@ async function openSession(manager?: SessionManager, settings?: Settings): Promi
     enableMCP: false,
     enableLsp: false,
     skipPythonPreflight: true,
-    toolNames: ["read", "grep"],
+    toolNames: options.toolNames ?? ["read", "grep"],
   });
   sessions.push(session);
   directories.push(path.join(getAgentDir(), "conduct", session.sessionManager.getSessionId()));
@@ -253,6 +272,33 @@ test("mode restores from disk without leaking to another session", async () => {
   await command(resumed, "off");
   expect(resumed.getActiveToolNames()).not.toContain("conduct_task");
   expect(resumed.getEnabledToolNames()).toContain("read");
+});
+
+test("enabled Code Mode keeps the canonical handoff in the system prompt when dispatch is eval-only", async () => {
+  const settings = Settings.isolated({
+    "memory.backend": "off",
+    "advisor.enabled": false,
+    "autolearn.enabled": false,
+    "providers.openai-codex.codeMode": "on",
+  });
+  const session = await openSession(undefined, settings, {
+    model: "openai-codex/codex",
+    toolNames: ["eval", "read", "grep"],
+  });
+  await command(session, "model conduct-test/worker");
+  await command(session, "on");
+
+  expect(session.getEvalBridgeToolNames()).toContain("conduct_task");
+  expect(session.getActiveToolNames()).not.toContain("conduct_task");
+  expect(session.getCodeModeDirectToolNames()).not.toContain("conduct_task");
+
+  const runner = session.extensionRunner!;
+  const enabled = await runner.emitBeforeAgentStart("dispatch", undefined, []);
+  expect(enabled?.systemPrompt).toEqual(expect.arrayContaining([taskDescription]));
+
+  await command(session, "off");
+  const off = await runner.emitBeforeAgentStart("dispatch", undefined, []);
+  expect(off?.systemPrompt ?? []).not.toContain(taskDescription);
 });
 
 test("turning off preserves tools enabled by another component", async () => {
